@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f16">
+<meta name="color-scheme" content="dark">
+<title>Blockvale UI harness</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Silkscreen&display=swap">
+<link rel="stylesheet" href="../../../style.css">
+<script>
+  // ?stub (or a missing src/textures.js) swaps in harness icons through an import map.
+  (function () {
+    var q = new URLSearchParams(location.search);
+    var stub = q.has('stub');
+    if (!stub) {
+      try {
+        var x = new XMLHttpRequest();
+        x.open('HEAD', '../../../src/textures.js', false);
+        x.send();
+        stub = x.status !== 200;
+      } catch (e) { stub = true; }
+    }
+    if (stub) document.write('<script type="importmap">{"imports":{"/src/textures.js":"/tools/tests/ui/stub-textures.js"}}<\/script>');
+    window.__stub = stub;
+  })();
+</script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui"><div class="screen title-screen boot is-open" aria-hidden="true"><div class="title-main"><div class="brand"><div class="logo-mark"></div><div class="logo">Blockvale</div><p class="tagline">A voxel sandbox</p></div><div class="title-menu"><p class="boot-status">Loading</p></div></div></div></div>
+<script type="module" src="./harness.js"></script>
+</body>
+</html>

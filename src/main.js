@@ -9,7 +9,7 @@ import { Input } from './input.js';
 import { Sound } from './audio.js';
 import { UI } from './ui.js';
 import { ParticleSystem } from './particles.js';
-import { loadSettings, saveSettings } from './config.js';
+import { loadSettings } from './config.js';
 import { B, BLOCKS, DEFAULT_HOTBAR, OPAQUE, EMIT, HEIGHT } from './blocks.js';
 import { clamp } from './math.js';
 
@@ -199,6 +199,7 @@ function boot() {
   function pause() {
     if (state !== 'playing') return;
     state = 'paused';
+    if (document.pointerLockElement) document.exitPointerLock();
     if (ui.inventoryOpen) ui.toggleInventory(false);
     ui.showPause();
     saveGame();
@@ -220,10 +221,11 @@ function boot() {
     textures,
     settings,
     sound,
+    seed,
+    version: '1.0',
     onSettingsChange(next) {
       const scaleChanged = next.renderScale !== settings.renderScale;
-      settings = TEST ? { ...next, autoResolution: false } : next;
-      saveSettings(next);
+      settings = TEST ? { ...next, autoResolution: false } : next; // the UI persists `next` itself
       if (scaleChanged || !settings.autoResolution) dynScale = settings.renderScale;
       renderer.applySettings({ ...settings, renderScale: Math.min(dynScale, settings.renderScale) });
       applyAudioSettings();
@@ -241,6 +243,7 @@ function boot() {
       ui.hidePause();
       ui.showTitle();
     },
+    onInventoryClose: () => closeInventory(),
     onHotbarChange(ids, selected) {
       player.hotbar = ids.slice(0, 9);
       if (Number.isInteger(selected)) player.selected = clamp(selected, 0, 8);
@@ -436,6 +439,7 @@ function boot() {
     },
     setSettings(patch) {
       settings = { ...settings, ...patch };
+      ui.setSettings(settings);
       renderer.applySettings({ ...settings, renderScale: patch.renderScale ?? dynScale });
       if (patch.renderScale) dynScale = patch.renderScale;
     },
