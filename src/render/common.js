@@ -143,14 +143,16 @@ float ignFrame(vec2 p) { return ign(p + 5.588238 * mod(uEnv.y, 64.0)); }
 // pixel, snap the lookup to the texel centre, leaving a one-pixel anti-aliased seam between
 // texels. Pass the ORIGINAL uv gradients to textureGrad so mip/anisotropy selection is unchanged.
 // clampTexels keeps magnified lookups inside the 16x16 tile (no bleed from the opposite edge).
-vec2 pixelArtUV(vec2 uv, bool clampTexels) {
+// (A macro so fwidth only expands in fragment shaders; GLSL_COMMON is shared with vertex shaders.)
+vec2 pixelArtUVd(vec2 uv, vec2 dTexels, bool clampTexels) {
   vec2 t = uv * 16.0;
-  vec2 d = max(fwidth(t), vec2(1e-5));
+  vec2 d = max(dTexels, vec2(1e-5));
   vec2 seam = floor(t + 0.5);
   vec2 s = seam + clamp((t - seam) / min(d, vec2(1.0)), -0.5, 0.5);
   if (clampTexels) s = mix(s, clamp(s, vec2(0.5), vec2(15.5)), step(d, vec2(1.0)));
   return s / 16.0;
 }
+#define pixelArtUV(uv, clampTexels) pixelArtUVd((uv), fwidth((uv) * 16.0), (clampTexels))
 
 // ---- Depth -------------------------------------------------------------------------------
 float linearDepth(float d) {
