@@ -1,0 +1,20 @@
+// node tools/tests/review/render/probe.mjs <page?query> <outName>
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import { startStaticServer } from '../../../static-server.mjs';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+const [pageUrl, name] = process.argv.slice(2);
+const server = await startStaticServer(root);
+const browser = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const page = await browser.newPage({ viewport: { width: 480, height: 270 } });
+page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[console.${m.type()}] ${m.text().slice(0, 400)}`); });
+page.on('pageerror', (e) => console.log(`[pageerror] ${e.message}`));
+await page.goto(`http://127.0.0.1:${server.address().port}/${pageUrl}`, { waitUntil: 'load' });
+await page.waitForFunction(() => window.__done, null, { timeout: 900000, polling: 500 });
+const res = await page.evaluate(() => window.__res);
+console.log(name, JSON.stringify(res));
+const img = await page.evaluate(() => window.__img || null);
+if (img) fs.writeFileSync(path.join(root, 'tools/out/review/render', name + '.png'), Buffer.from(img.split(',')[1], 'base64'));
+await browser.close(); server.close();

@@ -79,6 +79,7 @@ export class Input {
     this._lastMove = 0;
     this._lockPending = null;
     this._lockWaiter = null;
+    this._ignoreClicksUntil = 0;
 
     this._listeners = [];
     const on = (target, type, fn, opts) => {
@@ -123,6 +124,12 @@ export class Input {
     this.dx = 0;
     this.dy = 0;
     this.wheelSteps = 0;
+  }
+
+  // Ignore presses on the element for a moment (e.g. the rest of a double click that started on a
+  // menu button which has just disappeared).
+  suppressClicks(ms) {
+    this._ignoreClicksUntil = this.now() + ms;
   }
 
   releaseAll() {
@@ -289,6 +296,10 @@ export class Input {
   _onMouseDown(e) {
     const b = e.button;
     if (!(b >= 0 && b <= 2)) return;
+    if (this.now() < this._ignoreClicksUntil) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      return;
+    }
     // No middle-click autoscroll, no text selection while drag-looking.
     if ((b === 1 || this.locked || this.dragLook) && typeof e.preventDefault === 'function') e.preventDefault();
     this._blurFocused();
@@ -341,6 +352,13 @@ export class Input {
     }
     const g = this._gesture;
     if (!g) return;
+    if (e.buttons === 0) {
+      // The button came up where we never saw it (outside an embedding frame, over a context menu
+      // or another window): end the drag / hold instead of turning or digging forever.
+      this._gesture = null;
+      if (g.holding) this.buttons[g.button] = false;
+      return;
+    }
     const x = e.clientX || 0, y = e.clientY || 0;
     if (!g.dragging) {
       if (Math.hypot(x - g.x0, y - g.y0) <= DRAG_THRESHOLD) return;

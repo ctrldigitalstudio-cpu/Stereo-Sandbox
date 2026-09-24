@@ -1,0 +1,31 @@
+// Review (build/portability): WebGL context loss (GPU reset / TDR on Windows, backgrounded mobile tab).
+// Loses the context with WEBGL_lose_context, then resizes the window and changes a setting while lost.
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import { startStaticServer } from '../../../static-server.mjs';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+const server = await startStaticServer(root);
+const browser = await chromium.launch({ args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const page = await browser.newPage({ viewport: { width: 320, height: 180 } });
+page.on('pageerror', (e) => console.log('[pageerror]', e.message.split('\n')[0]));
+page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log('[console]', m.type(), m.text().slice(0, 160)); });
+let navs = 0; page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
+await page.goto(`http://127.0.0.1:${server.address().port}/dist/index.html?test`, { waitUntil: 'load' });
+await page.waitForFunction(() => window.__game && window.__game.loaded(2) >= 1, null, { timeout: 90000, polling: 500 });
+console.log('--- losing context');
+await page.evaluate(() => { window.__lc = __game.renderer.gl.getExtension('WEBGL_lose_context'); window.__lc.loseContext(); });
+await page.waitForTimeout(500);
+console.log('--- resizing window while lost');
+await page.setViewportSize({ width: 360, height: 200 });
+await page.waitForTimeout(1500);
+console.log('--- changing a setting while lost (shadow quality)');
+const r = await page.evaluate(() => { try { __game.setSettings({ shadowRes: 1024 }); return 'ok'; } catch (e) { return 'threw: ' + e.message; } });
+console.log('setSettings ->', r);
+const vis = await page.evaluate(() => ({ lost: __game.renderer.gl.isContextLost(), message: document.body.innerText.match(/graphics|reload|context/i)?.[0] || null }));
+console.log('while lost:', JSON.stringify(vis));
+console.log('--- restoring');
+await page.evaluate(() => window.__lc.restoreContext());
+await page.waitForTimeout(3000);
+console.log('main-frame navigations after start (reload count):', navs - 1);
+await browser.close(); server.close();

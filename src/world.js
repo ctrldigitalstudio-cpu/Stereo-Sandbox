@@ -26,6 +26,7 @@ export class World {
     this.lastWantTime = 0;
     this.meshesReceived = 0;
     this._last = null;                    // last chunk looked up (hot path cache)
+    this._unloading = new Map();          // key -> unload messages the worker hasn't acknowledged yet
 
     this.ready = new Promise((resolve) => { this._resolveReady = resolve; });
     this.worker = createWorker();
@@ -38,12 +39,23 @@ export class World {
 
   _onMessage(msg) {
     if (msg.type === 'ready') { this._resolveReady(); return; }
+    if (msg.type === 'unloaded') {
+      for (const [cx, cz] of msg.keys) {
+        const key = keyOf(cx, cz), n = (this._unloading.get(key) || 0) - 1;
+        if (n > 0) this._unloading.set(key, n); else this._unloading.delete(key);
+      }
+      return;
+    }
     if (msg.type !== 'mesh') return;
     const { cx, cz } = msg;
     const key = keyOf(cx, cz);
+    // Posted before the worker saw our unload of this chunk: stale. Keeping it would leave the
+    // worker believing we don't hold the chunk, so edits in and next to it would never re-mesh it.
+    // Messages are ordered, so anything after the acknowledgement answers a newer request.
+    if (this._unloading.has(key)) return;
     if (this.center && !this._inRange(cx, cz, this.renderDistance + 2)) {
       // Arrived after we moved away; tell the worker we don't hold it.
-      this.worker.postMessage({ type: 'unload', keys: [[cx, cz]] });
+      this._postUnload([[cx, cz]]);
       return;
     }
     let chunk = this.chunks.get(key);
@@ -54,6 +66,14 @@ export class World {
     }
     this.meshesReceived++;
     this.onMesh(cx, cz, msg);
+  }
+
+  _postUnload(keys) {
+    for (const [cx, cz] of keys) {
+      const key = keyOf(cx, cz);
+      this._unloading.set(key, (this._unloading.get(key) || 0) + 1);
+    }
+    this.worker.postMessage({ type: 'unload', keys });
   }
 
   _inRange(cx, cz, r) {
@@ -122,7 +142,7 @@ export class World {
         }
       }
       this._last = null;
-      if (drop.length) this.worker.postMessage({ type: 'unload', keys: drop });
+      if (drop.length) this._postUnload(drop);
     }
 
     const now = performance.now();
@@ -188,5 +208,6 @@ export class World {
   terminate() {
     this.worker.terminate();
     this.chunks.clear();
+    this._unloading.clear();
   }
 }

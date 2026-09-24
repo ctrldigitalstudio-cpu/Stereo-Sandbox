@@ -13,7 +13,8 @@ import { loadSettings, QUALITY_PRESETS } from './config.js';
 import { B, BLOCKS, DEFAULT_HOTBAR, OPAQUE, EMIT, HEIGHT } from './blocks.js';
 import { clamp } from './math.js';
 
-const SAVE_KEY = 'blockvale.save.v1';
+const SAVE_KEY = 'stereo-sandbox.save.v1';
+const LEGACY_SAVE_KEY = 'blockvale.save.v1';   // saves from before the rename to Stereo Sandbox (read-only)
 const params = new URLSearchParams(location.search);
 const TEST = params.has('test');
 const SUN_TILT = (25 * Math.PI) / 180;
@@ -26,8 +27,9 @@ function sunDirection(timeOfDay) {
 
 function loadSave() {
   try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const raw = localStorage.getItem(SAVE_KEY) || localStorage.getItem(LEGACY_SAVE_KEY);
+    const save = raw ? JSON.parse(raw) : null;
+    return save && typeof save === 'object' ? save : null;
   } catch (e) {
     return null;
   }
@@ -40,14 +42,16 @@ function writeSave(data) {
 }
 
 function clearSave() {
+  // Both keys: a leftover legacy save would otherwise be picked up again as the "new" world.
   try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
+  try { localStorage.removeItem(LEGACY_SAVE_KEY); } catch (e) { /* ignore */ }
 }
 
 function fatal(message, detail) {
   const el = document.createElement('div');
   el.className = 'fatal-error';
   el.setAttribute('role', 'alert');
-  el.innerHTML = '<h1>Blockvale can\'t start</h1><p></p><pre></pre>';
+  el.innerHTML = '<h1>Stereo Sandbox can\'t start</h1><p></p><pre></pre>';
   el.querySelector('p').textContent = message;
   el.querySelector('pre').textContent = detail || '';
   Object.assign(el.style, {
@@ -131,12 +135,12 @@ function boot() {
   const particles = new ParticleSystem(textures);
 
   const spawn = gen.findSpawn();
-  if (save && save.player) {
-    const s = save.player;
-    player.pos = [s.x, s.y, s.z];
-    player.yaw = s.yaw || 0;
-    player.pitch = s.pitch || 0;
-    player.flying = !!s.flying;
+  const sp = save && save.player;
+  if (sp && [sp.x, sp.y, sp.z].every(Number.isFinite)) {
+    player.pos = [sp.x, clamp(sp.y, 1, HEIGHT + 64), sp.z];
+    player.yaw = Number.isFinite(sp.yaw) ? sp.yaw : 0;
+    player.pitch = Number.isFinite(sp.pitch) ? clamp(sp.pitch, -1.57, 1.57) : 0;
+    player.flying = !!sp.flying;
   } else {
     player.pos = [spawn.x, spawn.y, spawn.z];
     player.yaw = 0.6;
@@ -159,29 +163,40 @@ function boot() {
   let dynScale = settings.renderScale;
   let slowTime = 0, fastTime = 0;
   let saveTimer = 0;
+  let discarded = false;          // "New world": nothing may re-save the old world while the page unloads
   let biomeName = '';
   let lastHotbarSig = '';
   const captureWaiters = [];      // pending __game.capture() calls (tests)
+  let skipRender = false;         // tests: simulate without drawing (software GL takes seconds per frame)
+  const lastCam = { pos: [0, 0, 0], yaw: 0, pitch: 0 };
 
-  // Title-screen camera: a slow pan above the spawn area, starting just left of the sun so the
-  // golden-hour light rakes across the terrain and swings past the sun after ~40 s.
-  const anchor = { x: player.pos[0], z: player.pos[2], y: player.pos[1] };
-  let top = anchor.y;
-  for (let dz = -24; dz <= 24; dz += 3) {
-    for (let dx = -24; dx <= 24; dx += 3) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
+  // Title-screen camera: a slow pan above the player's area (spawn in a new world), starting just
+  // left of the sun so the golden-hour light rakes across the terrain and swings past the sun
+  // after ~40 s. Re-aimed when the player quits to the title, so the world there is already loaded.
+  const anchor = { x: 0, y: 0, z: 0 };
+  let sunYaw = 0, titleT0 = 0;
+  function aimTitleCamera() {
+    anchor.x = player.pos[0];
+    anchor.z = player.pos[2];
+    let top = player.pos[1];
+    for (let dz = -24; dz <= 24; dz += 3) {
+      for (let dx = -24; dx <= 24; dx += 3) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
+    }
+    anchor.y = Math.min(HEIGHT + 24, top + 14); // clears the tallest trees (~12 blocks)
+    const sun = sunDirection(timeOfDay);
+    sunYaw = Math.atan2(-sun[0], -sun[2]);     // yaw whose forward vector points at the sun
   }
-  anchor.y = Math.min(HEIGHT + 24, top + 14); // clears the tallest trees (~12 blocks)
-  const sun0 = sunDirection(timeOfDay);
-  const sunYaw = Math.atan2(-sun0[0], -sun0[2]); // yaw whose forward vector points at the sun
-  const titleCam = { pos: [anchor.x, anchor.y, anchor.z], yaw: sunYaw - 0.75, pitch: -0.14 };
-  function updateTitleCamera(t) {
-    titleCam.yaw = sunYaw - 0.75 + t * 0.018;
-    titleCam.pitch = -0.15 + 0.035 * Math.sin(t * 0.05);
-    titleCam.pos = [anchor.x + Math.sin(t * 0.011) * 5, anchor.y + Math.sin(t * 0.07) * 0.6, anchor.z + Math.cos(t * 0.009) * 5];
+  aimTitleCamera();
+  function titleCameraAt(t) {
+    return {
+      pos: [anchor.x + Math.sin(t * 0.011) * 5, anchor.y + Math.sin(t * 0.07) * 0.6, anchor.z + Math.cos(t * 0.009) * 5],
+      yaw: sunYaw - 0.75 + t * 0.018,
+      pitch: -0.15 + 0.035 * Math.sin(t * 0.05),
+    };
   }
 
   function saveGame() {
-    if (TEST) return;
+    if (TEST || discarded) return;
     writeSave({
       seed,
       time: timeOfDay,
@@ -192,14 +207,24 @@ function boot() {
     });
   }
 
+  let lockHintShown = false;
   function requestPlayLock() {
     sound.resume();
     input.requestLock().then((ok) => {
-      if (!ok && !TEST && !input.locked) ui.toast('Mouse capture is blocked here. Drag with the mouse to look around.');
+      // Once per session: in a sandboxed frame every resume fails the same way.
+      if (!ok && !TEST && !input.locked && !lockHintShown) {
+        lockHintShown = true;
+        ui.toast('Mouse capture is blocked here. Drag with the mouse to look around.');
+      }
     });
   }
 
+  // The second click of a double-clicked Play / Resume / Done lands on the canvas once the menu is
+  // gone: don't let it break a block the moment the game starts.
+  const DOUBLE_CLICK_MS = 400;
+
   function startPlaying() {
+    input.suppressClicks(DOUBLE_CLICK_MS);
     state = 'playing';
     ui.hideTitle();
     ui.hidePause();
@@ -243,17 +268,20 @@ function boot() {
     onPlay: startPlaying,
     onResume: startPlaying,
     onNewWorld() {
+      discarded = true;             // pagehide / visibilitychange during the reload would write it back
       clearSave();
       world.terminate();
       location.reload();
     },
     onQuit() {
       saveGame();
+      aimTitleCamera();
+      titleT0 = time;
       state = 'title';
       ui.hidePause();
       ui.showTitle();
     },
-    onInventoryClose: () => closeInventory(),
+    onInventoryClose: () => { input.suppressClicks(DOUBLE_CLICK_MS); closeInventory(); },   // Done button
     onHotbarChange(ids, selected) {
       player.hotbar = ids.slice(0, 9);
       if (Number.isInteger(selected)) player.selected = clamp(selected, 0, 8);
@@ -329,10 +357,7 @@ function boot() {
     const allowInput = state === 'playing' && !ui.menuOpen;
     let camPos, yaw, pitch, fovScale = 1, bob = { x: 0, y: 0 };
     if (state === 'title') {
-      updateTitleCamera(time);
-      camPos = titleCam.pos;
-      yaw = titleCam.yaw;
-      pitch = titleCam.pitch;
+      ({ pos: camPos, yaw, pitch } = titleCameraAt(time - titleT0));
     } else {
       if (state === 'playing') player.update(dt, settings, allowInput);
       const eye = player.eye();
@@ -344,6 +369,9 @@ function boot() {
       fovScale = player.fovScale();
     }
 
+    lastCam.pos = camPos;
+    lastCam.yaw = yaw;
+    lastCam.pitch = pitch;
     const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
     world.update(camPos[0], camPos[2], settings.renderDistance, fx, fz);
 
@@ -359,7 +387,7 @@ function boot() {
     particles.update(dt, world);
 
     const playingView = state !== 'title' && !hudHidden;
-    renderer.render({
+    if (!skipRender || captureWaiters.length) renderer.render({
       camPos, yaw, pitch,
       fov: (settings.fov * Math.PI / 180) * fovScale,
       time, dt, timeOfDay, sunDir, moonDir,
@@ -434,6 +462,7 @@ function boot() {
     player, world, renderer, ui, gen, particles,
     get settings() { return settings; },
     get state() { return state; },
+    get camera() { return { pos: lastCam.pos.slice(), yaw: lastCam.yaw, pitch: lastCam.pitch }; },
     get timeOfDay() { return timeOfDay; },
     get frame() { return frameIndex; },
     setTime(t) { timeOfDay = ((t % 1) + 1) % 1; },
@@ -455,6 +484,8 @@ function boot() {
     },
     loaded: (r = 3) => world.loadedFraction(r),
     capture: () => new Promise((resolve) => captureWaiters.push(resolve)),
+    setRender(on) { skipRender = !on; },
+    titleCameraAt,
   };
 
   requestAnimationFrame(frame);

@@ -2,10 +2,11 @@
 // shadow (depth only) and water. See SPEC.md "Terrain renderer".
 
 import { Program } from '../gl.js';
-import { GLSL_COMMON, GLSL_BLOCK_VERTEX } from './common.js';
+import { GLSL_COMMON, GLSL_BLOCK_VERTEX, EDGE_BINS } from './common.js';
 import { setupVertexAttribs, createQuadIndices, WORDS_PER_VERTEX } from '../vertex.js';
 import { aabbInFrustum } from '../math.js';
-import { CHUNK, HEIGHT } from '../blocks.js';
+import { CHUNK, HEIGHT, B, SHAPE, SHAPE_CROSS, SHAPE_TORCH } from '../blocks.js';
+import { defaultTint } from '../textures.js';
 
 const WORDS_PER_QUAD = WORDS_PER_VERTEX * 4;
 const INITIAL_INDEX_QUADS = 196608;
@@ -52,10 +53,12 @@ vec3 waveOffset(vec3 wp, uint flags, float t) {
 export const GLSL_LIGHTING = `
 const vec3 TORCH_COLOR = vec3(1.0, 0.62, 0.32);
 ${vogelGLSL('VOGEL12', 12)}${vogelGLSL('VOGEL10', 10)}${vogelGLSL('VOGEL8', 8)}
-// Block light: inverse-square-like falloff over Minecraft light levels (bl = level / 15).
+// Block light over Minecraft light levels (bl = level / 15; a level drops by one per block, so
+// 15 - level ~ blocks from the source). Close to inverse square with a ~1.5-block core, faded to
+// zero at level 0: warm pools of light around torches rather than an evenly lit room.
 vec3 blockLightColor(float bl, vec3 worldPos) {
   float d = 15.0 * (1.0 - bl);
-  float I = bl / (1.0 + 0.08 * d * d) * 3.0;
+  float I = 3.2 / (1.0 + 0.42 * d * d) * smoothstep(0.0, 0.4, bl);
   float t = uCamPos.w;
   float ph = dot(worldPos, vec3(0.37, 0.21, 0.29));
   float flicker = 1.0 + 0.05 * sin(t * 9.7 + ph) + 0.035 * sin(t * 23.3 + ph * 1.7) + 0.02 * sin(t * 41.0 + ph * 0.6);
@@ -115,7 +118,9 @@ float shadowVisibility(vec3 posRel, vec3 offsetDir, float fallback, bool soft, o
   sc.z -= 0.00005;
   float texel = 1.0 / uShadow.z;
   float uvPerBlock = (1.0 - SHADOW_DISTORT) / (2.0 * uShadow.y * f * f);
-  float a = ignFrame(gl_FragCoord.xy) * 6.2831853;
+  // Static per-pixel rotation: there is no temporal accumulation, so a per-frame pattern would
+  // only make penumbrae crawl.
+  float a = ign(gl_FragCoord.xy) * 6.2831853;
   mat2 rot = mat2(cos(a), sin(a), -sin(a), cos(a));
   float vis = 0.0;
   float thickness;
@@ -304,7 +309,9 @@ void main() {
   vec3 L = uLightDir.xyz;
   float sky = vLight.x, blk = vLight.y;
   float ao = vAO;
-  float aoCurve = ao * ao * 0.55 + ao * 0.35 + 0.1;
+  // Vertex AO levels 0..3 -> 0.3, 0.47, 0.69, 1: soft contact shadows (vanilla-like depth)
+  // instead of near-black creases on the shadow side.
+  float aoCurve = 0.3 + 0.7 * (ao * 0.55 + ao * ao * 0.45);
 
   // ---- Direct light (sun or moon) ----
   float caveGate = smoothstep(0.1, 0.45, sky);
@@ -336,15 +343,17 @@ void main() {
 
   // Underwater: caustics and wavelength-dependent absorption of sunlight on the way down
   vec3 ambientTint = vec3(1.0);
+  // (Only the way down: the view path through the water is absorbed by the water surface shader,
+  // or by the composite pass when the camera is under water.)
   if ((vFlags & FLAG_UNDERWATER) != 0u && vWorld.y < SEA_LEVEL) {
     float depth = SEA_LEVEL - vWorld.y;
     float Ly = max(L.y, 0.12);
     vec2 cp = vWorld.xz + L.xz / Ly * depth;
     float c = caustics(cp, t);
-    vec3 absorb = exp(-vec3(0.33, 0.085, 0.045) * (depth / Ly + depth));
-    direct *= absorb * mix(c, 1.0, saturate(depth * 0.035));
+    vec3 absorb = exp(-WATER_EXT * (depth / Ly));
+    direct *= absorb * mix(c, 1.0, saturate(depth * 0.03));
     trans *= absorb;
-    ambientTint = exp(-vec3(0.22, 0.06, 0.035) * depth);
+    ambientTint = exp(-WATER_EXT * depth * 1.2);
   }
 
   // ---- Ambient + block light ----
@@ -462,7 +471,7 @@ vec2 waveSlope(vec2 p, float t) {
 // Clouds seen in a reflection: coverage where the ray crosses the middle of the cloud layer.
 vec3 skyReflection(vec3 R, vec3 worldPos) {
   vec3 d = normalize(vec3(R.x, max(R.y, 0.02), R.z));
-  vec3 s = sampleSky(d);
+  vec3 s = hazedSky(d);
   if (uQuality.z > 0.5 && uEnv.z > 0.0 && d.y > 0.03) {
     float mid = 0.5 * (CLOUD_BOTTOM + CLOUD_TOP);
     float tHit = max(mid - worldPos.y, 10.0) / d.y;
@@ -590,14 +599,16 @@ void main() {
     color = mix(water, refl, F) + glint;
   } else {
     // ---- Seen from below: Snell's window, total internal reflection outside it ----
+    // Outside the window the surface mirrors the water body: the in-scatter colour just below it.
     vec3 Tdir = refract(I, N, 1.333);
     vec3 above = textureLod(uSceneColor, suv + nView.xy * 0.04, 0.0).rgb;
+    vec3 body = underwaterLight(1.0) * WATER_SCATTER * 0.55 * max(uCam.w, 0.06);
     if (dot(Tdir, Tdir) < 1e-4) {
-      color = deep;
+      color = body;
     } else {
       float cosT = saturate(dot(Tdir, -N));
       float F = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
-      color = mix(above, deep, F);
+      color = mix(above, body, F);
     }
   }
 
@@ -698,13 +709,119 @@ export class TerrainRenderer {
     c.maxY = Number.isFinite(msg.maxY) ? msg.maxY : HEIGHT; // exclusive: top of the geometry
     c.opaque = this._setMesh(c.opaque, msg.opaque, msg.opaqueQuads);
     c.water = this._setMesh(c.water, msg.water, msg.waterQuads);
+    if (msg.blocks) c.blocks = msg.blocks;
+    c.summary = undefined;       // recomputed lazily by edgeMap()
+    this._edgeDirty = true;
     this.stats.loaded = this.chunks.size;
+  }
+
+  // Mean top-face albedo (linear RGB) per block id, from the 1x1 mip of the texture set with
+  // the default biome tint applied through the tint-mask average.
+  _albedoTable() {
+    if (this._albedo) return this._albedo;
+    const t = this.textureSet, n = 256;
+    const tbl = new Float32Array(n * 3).fill(0.3);
+    const lv = t && t.albedo ? t.albedo.length - 1 : -1;
+    const lin = (v) => Math.pow(v / 255, 2.2);
+    if (lv >= 0 && t.faceLayers) {
+      const sz = Math.max(1, (t.size || 16) >> lv);
+      const al = t.albedo[lv], sp = t.spec && t.spec[lv];
+      for (let id = 0; id < Math.min(n, t.faceLayers.length / 6); id++) {
+        const layer = t.faceLayers[id * 6 + 2];
+        const o = layer * sz * sz * 4;
+        if (!al || o + 3 >= al.length) continue;
+        const mask = sp ? sp[o + 3] / 255 : 0;
+        const tint = defaultTint(id);
+        for (let k = 0; k < 3; k++) tbl[id * 3 + k] = lin(al[o + k]) * (1 - mask + mask * lin(tint[k]));
+      }
+    }
+    this._albedo = tbl;
+    return tbl;
+  }
+
+  // Top surface of a chunk: land albedo and height, ocean fraction (null without block data).
+  _summarize(c) {
+    const blocks = c.blocks;
+    if (!blocks || blocks.length < CHUNK * CHUNK * HEIGHT) return null;
+    const tbl = this._albedoTable();
+    let land = 0, ocean = 0, r = 0, g = 0, b = 0, h = 0;
+    const top = Math.min(HEIGHT - 1, c.maxY | 0);
+    for (let col = 0; col < 256; col++) {
+      for (let y = top; y >= 0; y--) {
+        const id = blocks[col | (y << 8)];
+        if (id === 0 || SHAPE[id] === SHAPE_CROSS || SHAPE[id] === SHAPE_TORCH) continue;
+        if (id === B.WATER) ocean++;
+        else { land++; r += tbl[id * 3]; g += tbl[id * 3 + 1]; b += tbl[id * 3 + 2]; h += y + 1; }
+        break;
+      }
+    }
+    const n = land || 1;
+    return { r: r / n, g: g / n, b: b / n, h: land ? h / n : 0, land, ocean: ocean / 256 };
+  }
+
+  // Summary of the terrain near the loaded-area edge in EDGE_BINS azimuth bins around the camera
+  // (angle = atan2(dz, dx)), for the void past the render distance. Returns null when nothing
+  // changed. out: texel i = (land albedo rgb, ocean fraction), texel EDGE_BINS + i = (land
+  // height, 0, 0, valid 0/1).
+  edgeMap(camPos, radius) {
+    const moved = !this._edgeCam || Math.hypot(camPos[0] - this._edgeCam[0], camPos[2] - this._edgeCam[1]) > 3;
+    if (!this._edgeDirty && !moved) return null;
+    this._edgeDirty = false;
+    this._edgeCam = [camPos[0], camPos[2]];
+    const N = EDGE_BINS;
+    const acc = this._edgeAcc || (this._edgeAcc = new Float64Array(N * 7));
+    acc.fill(0);
+    const r0 = radius * 0.45, r1 = radius * 0.9;
+    for (const c of this.chunks.values()) {
+      const dx = c.cx * CHUNK + CHUNK / 2 - camPos[0], dz = c.cz * CHUNK + CHUNK / 2 - camPos[2];
+      const d = Math.hypot(dx, dz);
+      if (d < r0) continue;
+      if (c.summary === undefined) c.summary = this._summarize(c);
+      const s = c.summary;
+      if (!s) continue;
+      const t = Math.min(1, (d - r0) / (r1 - r0));
+      const w = t * t * (3 - 2 * t) + 0.05;
+      const phi = Math.atan2(dz, dx) / (Math.PI * 2) * N;
+      const half = Math.atan2(CHUNK * 0.7, d) / (Math.PI * 2) * N;
+      for (let k = Math.floor(phi - half); k <= Math.floor(phi + half); k++) {
+        const i = ((k % N) + N) % N, o = i * 7;
+        const lw = w * (1 - s.ocean) * (s.land > 0 ? 1 : 0);
+        acc[o] += s.r * lw; acc[o + 1] += s.g * lw; acc[o + 2] += s.b * lw; acc[o + 3] += s.h * lw;
+        acc[o + 4] += lw; acc[o + 5] += s.ocean * w; acc[o + 6] += w;
+      }
+    }
+    const out = this._edgeOut || (this._edgeOut = new Float32Array(N * 2 * 4));
+    const has = (i) => acc[i * 7 + 6] > 0;
+    let any = false;
+    for (let i = 0; i < N; i++) if (has(i)) { any = true; break; }
+    for (let i = 0; i < N; i++) {
+      // Empty bins (still loading) borrow from the nearest filled ones on either side.
+      let src = [i], wts = [1];
+      if (!has(i) && any) {
+        let a = 1, b = 1;
+        while (!has((i - a + N) % N)) a++;
+        while (!has((i + b) % N)) b++;
+        src = [(i - a + N) % N, (i + b) % N];
+        wts = [b / (a + b), a / (a + b)];
+      }
+      let r = 0, g = 0, bl = 0, h = 0, lw = 0, oc = 0, ow = 0;
+      src.forEach((j, k) => {
+        const o = j * 7, q = wts[k];
+        r += acc[o] * q; g += acc[o + 1] * q; bl += acc[o + 2] * q; h += acc[o + 3] * q; lw += acc[o + 4] * q;
+        oc += acc[o + 5] * q; ow += acc[o + 6] * q;
+      });
+      const ocean = ow > 0 ? oc / ow : 0;
+      out.set(lw > 0 ? [r / lw, g / lw, bl / lw, ocean] : [0.1, 0.12, 0.08, ocean], i * 4);
+      out.set([lw > 0 ? h / lw : 60, 0, 0, any ? 1 : 0], (N + i) * 4);
+    }
+    return out;
   }
 
   remove(cx, cz) {
     const key = `${cx},${cz}`;
     const c = this.chunks.get(key);
     if (!c) return;
+    this._edgeDirty = true;
     if (c.opaque) this._freeMesh(c.opaque);
     if (c.water) this._freeMesh(c.water);
     this.chunks.delete(key);

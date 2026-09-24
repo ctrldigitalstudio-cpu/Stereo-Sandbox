@@ -4,7 +4,7 @@
 
 import { createGL, createTexture2D, createDepthTexture, createFramebuffer, UNIT } from './gl.js';
 import { mat4, forwardFromYawPitch, frustumPlanes } from './math.js';
-import { FrameUniforms, computeShadowMatrix } from './render/common.js';
+import { FrameUniforms, computeShadowMatrix, IRRADIANCE_TEXELS, EDGE_BINS } from './render/common.js';
 import { TerrainRenderer } from './render/terrain.js';
 import { Overlays } from './render/overlays.js';
 import { Atmosphere } from './render/atmosphere.js';
@@ -352,7 +352,11 @@ export class Renderer {
     U.vec('uMoonDir', sky.moonDir[0], sky.moonDir[1], sky.moonDir[2], sky.moonVisibility);
     U.vec('uLightDir', sky.lightDir[0], sky.lightDir[1], sky.lightDir[2], sky.lightIsSun ? 1 : 0);
     U.vec('uRes', W, H, 1 / W, 1 / H);
-    U.vec('uCam', NEAR, far, s.renderDistance * 16 - 8, eyeSkyLight);
+    // uCam.z: horizontal distance by which terrain must have dissolved into the void. World
+    // streaming keeps chunks within renderDistance + 0.5 chunk rings of the camera's chunk, so an
+    // unloaded chunk can come as close as ~renderDistance * 16 - 13 blocks.
+    const edgeDist = Math.max(s.renderDistance * 16 - 14, 24);
+    U.vec('uCam', NEAR, far, edgeDist, eyeSkyLight);
     U.vec('uShadow', shadowsOn ? 1 : 0, s.shadowRadius, shadowsOn ? this.shadowRes : 1, LIGHT_ANGULAR_SIZE);
     U.vec('uEnv', underwater ? 1 : 0, this.frameIndex % 65536, cloudCoverage, sky.timeOfDay);
     U.vec('uWind', sky.wind[0], sky.wind[1], sky.starRotation, sky.fogDensity);
@@ -387,6 +391,15 @@ export class Renderer {
     view.frameIndex = this.frameIndex;
 
     this._bindStandardTextures();
+
+    // Far-terrain summary per azimuth (drawn past the loaded area by the sky pass and the fog),
+    // stored after the lighting texels of the irradiance texture. Only uploaded when it changed.
+    const edge = this.terrain.edgeMap && this.hdr.type !== gl.UNSIGNED_BYTE ? this.terrain.edgeMap(camPos, edgeDist) : null;
+    if (edge) {
+      gl.activeTexture(gl.TEXTURE0 + UNIT.IRRADIANCE);
+      gl.bindTexture(gl.TEXTURE_2D, this.atmosphere.irradiance);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, IRRADIANCE_TEXELS, 0, 2 * EDGE_BINS, 1, gl.RGBA, gl.FLOAT, edge);
+    }
 
     // 1. Sky LUT + irradiance (only re-rendered when the sun, moon or altitude moved enough).
     const lutUpdated = this.atmosphere.update(camPos[1]);
@@ -449,9 +462,11 @@ export class Renderer {
       this._run('drawHeld', () => this.overlays.drawHeld(view, frame.held));
     }
 
-    // 7-10. Bloom, exposure, tone map, FXAA to the canvas.
-    post.bloom(!!s.bloom);
-    post.exposureUpdate(frame.dt || 1 / 60);
+    // 7-10. Bloom downsample, exposure (meters a plain downsampled level + the scene depth),
+    // bloom upsample, tone map, FXAA to the canvas.
+    post.downsample(!!s.bloom);
+    post.exposureUpdate(frame.dt || 1 / 60, this.sceneDepth);
+    if (s.bloom) post.upsample();
     const bloomStrength = s.bloom ? 0.05 + 0.035 * sky.night : 0;
     post.finish(this.width, this.height, { fxaa: !!s.fxaa, bloomStrength });
 

@@ -505,7 +505,7 @@ export class UI {
       dl.append(h('dt', null, label), dd);
     }
     el.debug = h('div', { class: 'debug-panel', hidden: true, 'aria-label': 'Debug information' },
-      h('div', { class: 'debug-head' }, `Blockvale ${this.opts.version || VERSION}`, h('span', null, 'F3')), dl);
+      h('div', { class: 'debug-head' }, `Stereo Sandbox ${this.opts.version || VERSION}`, h('span', null, 'F3')), dl);
 
     el.hudSlots = [];
     const bar = h('div', { class: 'hotbar' });
@@ -551,14 +551,15 @@ export class UI {
       h('div', { class: 'title-main' },
         h('header', { class: 'brand' },
           el.logoMark,
-          h('h1', { class: 'logo' }, 'Blockvale'),
-          h('p', { class: 'tagline' }, 'A voxel sandbox')),
+          h('h1', { class: 'logo' },
+            h('span', { class: 'logo-word' }, 'Stereo'), ' ', h('span', { class: 'logo-word' }, 'Sandbox')),
+          h('p', { class: 'tagline' }, 'A voxel world to build in')),
         h('div', { class: 'title-menu' },
           h('div', { class: 'play-wrap' }, el.play, el.progress),
           h('div', { class: 'menu-row' }, settings, controls),
           el.status,
           h('p', { class: 'touch-note' },
-            'Blockvale is played with a keyboard and mouse. On this device you can enjoy the view.'))),
+            'Stereo Sandbox is played with a keyboard and mouse. On this device you can enjoy the view.'))),
       h('footer', { class: 'title-footer' },
         h('span', null, `Version ${this.opts.version || VERSION}${seed}`),
         h('span', { class: 'title-legal' }, 'Not affiliated with Mojang or Microsoft')));
@@ -931,7 +932,7 @@ export class UI {
         try {
           url = makeBlockIcon(this.textures, id, 64).toDataURL('image/png');
         } catch (e) {
-          console.warn(`Blockvale UI: no icon for ${BLOCKS[id].name}:`, e && e.message);
+          console.warn(`Stereo Sandbox UI: no icon for ${BLOCKS[id].name}:`, e && e.message);
         }
       }
       this._icons.set(id, url);

@@ -95,6 +95,9 @@ export class WorldService {
 
   unload(keys) {
     for (const [cx, cz] of keys || []) this.held.delete(chunkKey(cx, cz));
+    // Acknowledge: a mesh of these chunks main receives before this reply was posted before the
+    // unload (stale, main drops it); one after it answers a newer 'want'.
+    this.post({ type: 'unloaded', keys: keys || [] });
     this._evict();
   }
 
