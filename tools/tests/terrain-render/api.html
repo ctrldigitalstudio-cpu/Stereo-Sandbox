@@ -1,0 +1,151 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>terrain-render API test</title>
+<canvas id="c" width="320" height="180"></canvas>
+<script type="module">
+// Exercises TerrainRenderer / Overlays edge cases and checks for GL errors.
+import { createGL, UNIT, createDepthTexture, createFramebuffer, createTexture2D } from '../../../src/gl.js';
+import { FrameUniforms } from '../../../src/render/common.js';
+import { mat4, frustumPlanes } from '../../../src/math.js';
+import { packVertex, FACES, QUAD_UV } from '../../../src/vertex.js';
+import { B, INVENTORY, BLOCKS } from '../../../src/blocks.js';
+import { buildTextures } from '../../../src/textures.js';
+import { TerrainRenderer } from '../../../src/render/terrain.js';
+import { Overlays, buildHeldMesh } from '../../../src/render/overlays.js';
+import { ParticleSystem } from '../../../src/particles.js';
+
+const results = [];
+const check = (cond, msg) => { results.push((cond ? 'ok   ' : 'FAIL ') + msg); if (!cond) console.error('FAIL', msg); };
+const gl = createGL(document.getElementById('c'));
+const glOk = (where) => { const e = gl.getError(); check(e === 0, `no GL error: ${where}${e ? ' (0x' + e.toString(16) + ')' : ''}`); };
+const tex = buildTextures();
+const fu = new FrameUniforms(gl);
+const proj = mat4.perspective(mat4.create(), 1.2, 16 / 9, 0.08, 400);
+const view = mat4.lookAt(mat4.create(), [0, 0, 0], [0, -0.3, -1], [0, 1, 0]);
+const vp = mat4.multiply(mat4.create(), proj, view);
+fu.mat('uView', view); fu.mat('uProj', proj); fu.mat('uViewProj', vp); fu.mat('uInvViewProj', mat4.invert(mat4.create(), vp));
+fu.vec('uRes', 320, 180, 1 / 320, 1 / 180); fu.vec('uCam', 0.08, 400, 120, 1); fu.vec('uShadow', 0, 128, 1, 0.012);
+fu.vec('uLightDir', 0.3, 0.8, 0.2, 1); fu.vec('uCamPos', 8, 80, 8, 1);
+fu.upload();
+// Minimal standard bindings: 1x1 depth on 3/4, textures arrays left unbound is fine for GL validity
+const depth1 = createDepthTexture(gl, 1, 1);
+for (const u of [UNIT.SHADOW_CMP, UNIT.SHADOW_RAW]) { gl.activeTexture(gl.TEXTURE0 + u); gl.bindTexture(gl.TEXTURE_2D, depth1); }
+const cmp = gl.createSampler();
+gl.samplerParameteri(cmp, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+gl.samplerParameteri(cmp, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+gl.bindSampler(UNIT.SHADOW_CMP, cmp);
+gl.activeTexture(gl.TEXTURE15); // scratch unit for texture creation
+const color = createTexture2D(gl, 320, 180, gl.hdrFormat);
+const sceneDepth = createDepthTexture(gl, 320, 180);
+const fb = createFramebuffer(gl, [color], sceneDepth);
+gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+gl.viewport(0, 0, 320, 180);
+glOk('setup');
+
+const terrain = new TerrainRenderer(gl, tex);
+const overlays = new Overlays(gl, tex);
+glOk('constructors');
+
+// Synthetic mesh: n quads of top faces spread over the chunk
+function mesh(n, y = 64) {
+  const words = new Uint32Array(n * 16);
+  let o = 0;
+  const F = FACES[2];
+  for (let q = 0; q < n; q++) {
+    const x = q % 16, z = (q >> 4) % 16;
+    for (const [u, v] of QUAD_UV) {
+      o = packVertex(words, o, (x + F.base[0] + u * F.U[0] + v * F.V[0]) * 16, (y + F.base[1]) * 16, (z + F.base[2] + u * F.U[2] + v * F.V[2]) * 16,
+        u * 16, v * 16, tex.faceLayers[B.STONE * 6 + 2], 2, 3, 255, 0, 0, 255, 255, 255);
+    }
+  }
+  return words;
+}
+const msg = (nO, nW) => ({ opaque: mesh(nO), water: mesh(nW, 60), opaqueQuads: nO, waterQuads: nW, minY: 60, maxY: 64 });
+
+terrain.upload(0, -1, msg(100, 20));
+terrain.upload(1, -1, msg(50, 0));
+check(terrain.chunks.size === 2 && terrain.stats.loaded === 2, 'two chunks loaded');
+check(terrain.chunks.get('1,-1').water === null, 'empty water mesh -> null');
+const vao = terrain.chunks.get('0,-1').opaque.vao;
+terrain.upload(0, -1, msg(300, 0));
+check(terrain.chunks.get('0,-1').opaque.vao === vao, 'replace keeps the VAO');
+check(terrain.chunks.get('0,-1').opaque.quads === 300, 'replace updates quad count');
+check(terrain.chunks.get('0,-1').water === null, 'replace frees water mesh');
+glOk('upload/replace');
+
+const frustum = frustumPlanes(new Float32Array(24), vp);
+const v = { camPos: [8.5, 80, 8.5], frustum, time: 1 };
+gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+terrain.drawOpaque(v);
+check(terrain.stats.chunks === 2 && terrain.stats.drawCalls === 2 && terrain.stats.quads === 350, `stats after drawOpaque ${JSON.stringify(terrain.stats)}`);
+glOk('drawOpaque');
+
+// Culling: looking away (+Z) from chunks at z = -16..0
+const vp2 = mat4.multiply(mat4.create(), proj, mat4.lookAt(mat4.create(), [0, 0, 0], [0, -0.3, 1], [0, 1, 0]));
+terrain.drawOpaque({ camPos: [8.5, 80, 8.5], frustum: frustumPlanes(new Float32Array(24), vp2), time: 1 });
+check(terrain.stats.chunks === 0, 'frustum culls chunks behind the camera');
+
+// Index buffer growth past the initial size, then everything still draws
+const big = 200000;
+terrain.upload(2, -1, msg(big, 10));
+check(terrain.indexQuads >= big, `index buffer grew to ${terrain.indexQuads}`);
+gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+terrain.drawOpaque(v);
+glOk('draw after index growth');
+check(terrain.stats.quads === 300 + 50 + big, 'all quads drawn after growth');
+
+// Shadow pass: radius culling and optional light-space matrix culling
+gl.activeTexture(gl.TEXTURE15);
+const shadowTex = createDepthTexture(gl, 256, 256);
+const shadowFB = createFramebuffer(gl, [], shadowTex);
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB); gl.viewport(0, 0, 256, 256); gl.clear(gl.DEPTH_BUFFER_BIT);
+terrain.drawShadow({ camPos: [8.5, 80, 8.5], shadowCenter: [8, 80, 8], shadowRadius: 64, time: 1 });
+check(terrain.stats.shadowChunks === 3, 'shadow pass draws chunks in radius');
+terrain.drawShadow({ camPos: [8.5, 80, 8.5], shadowCenter: [1000, 80, 1000], shadowRadius: 64, time: 1 });
+check(terrain.stats.shadowChunks === 0, 'shadow pass skips far chunks');
+glOk('drawShadow');
+gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, 320, 180);
+
+// Water pass needs units 10/11
+gl.activeTexture(gl.TEXTURE15);
+const copy = createTexture2D(gl, 320, 180, gl.hdrFormat), copyD = createDepthTexture(gl, 320, 180);
+gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, copy);
+gl.activeTexture(gl.TEXTURE11); gl.bindTexture(gl.TEXTURE_2D, copyD);
+terrain.drawWater(v);
+check(terrain.stats.waterChunks === 1, 'one water chunk');
+glOk('drawWater');
+
+terrain.remove(2, -1);
+terrain.remove(9, 9); // unknown: no-op
+check(terrain.chunks.size === 2, 'remove');
+glOk('remove');
+
+// Overlays: nulls and every inventory block in hand
+overlays.drawSelection(v, null);
+overlays.drawSelection(v, { x: 3, y: 64, z: -5, id: B.TORCH });
+overlays.drawParticles(v, null);
+const ps = new ParticleSystem(tex);
+overlays.drawParticles(v, ps);
+ps.spawnBlockBreak(3, 64, -5, B.OAK_LEAVES);
+overlays.drawParticles(v, ps);
+glOk('selection/particles');
+let meshes = 0;
+for (const id of [...INVENTORY, B.WATER, B.LAVA, B.AIR, B.BEDROCK]) {
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+  overlays.drawHeld({ ...v, aspect: 16 / 9 }, { blockId: id, swing: 0.4, equip: 0.5, bobX: 0.01, bobY: -0.02, light: [0.8, 0.3] });
+  const m = overlays.heldMeshes.get(id);
+  if (m) meshes++;
+}
+check(meshes === INVENTORY.length + 1, `held meshes for all inventory blocks (+bedrock), none for fluids/air (${meshes})`);
+const sprite = buildHeldMesh(tex, B.POPPY);
+check(sprite.sprite && sprite.quads > 2, `poppy is an extruded sprite (${sprite.quads} quads)`);
+overlays.drawHeld(v, null);
+glOk('held');
+
+terrain.clear();
+check(terrain.chunks.size === 0, 'clear');
+glOk('end');
+window.__results = results;
+console.log(results.join('\n'));
+window.__done = true;
+</script>

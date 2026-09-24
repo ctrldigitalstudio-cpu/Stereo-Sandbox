@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>terrain-render integration</title>
+<style>html,body{margin:0;background:#000;width:100%;height:100%;overflow:hidden}canvas{display:block;width:100%;height:100%}</style>
+<canvas id="c"></canvas>
+<script type="module">
+// Integration: the real Renderer frame graph (atmosphere, post) drawing TerrainRenderer/Overlays
+// with a generated world. Same scenes/params as page.html.
+import { B, SEA } from '../../../src/blocks.js';
+import { buildTextures } from '../../../src/textures.js';
+import { WorldGen } from '../../../src/worldgen.js';
+import { meshChunk } from '../../../src/mesher.js';
+import { Renderer } from '../../../src/renderer.js';
+import { ParticleSystem } from '../../../src/particles.js';
+
+const q = new URLSearchParams(location.search);
+const SCENE = q.get('scene') || 'noon';
+const log = (...a) => console.log('[integration]', ...a);
+// ---------------------------------------------------------------------------------------------
+// World: generate, edit, mesh.
+// ---------------------------------------------------------------------------------------------
+const gen = new WorldGen(12345);
+const chunkData = new Map();
+function chunk(cx, cz) {
+  const k = cx + ',' + cz;
+  let c = chunkData.get(k);
+  if (!c) { c = gen.generateChunk(cx, cz); chunkData.set(k, c); }
+  return c;
+}
+function setBlock(x, y, z, id) {
+  const c = chunk(Math.floor(x / 16), Math.floor(z / 16));
+  c.blocks[(x & 15) | ((z & 15) << 4) | (y << 8)] = id;
+}
+function getBlock(x, y, z) {
+  if (y < 0) return B.BEDROCK;
+  if (y >= 128) return 0;
+  const c = chunk(Math.floor(x / 16), Math.floor(z / 16));
+  return c.blocks[(Math.floor(x) & 15) | ((Math.floor(z) & 15) << 4) | (Math.floor(y) << 8)];
+}
+const worldView = {
+  getBlock,
+  isSolid: (x, y, z) => { const id = getBlock(Math.floor(x), Math.floor(y), Math.floor(z)); return id !== 0 && id !== B.WATER && id !== B.TALL_GRASS && id !== B.TORCH && id !== B.POPPY && id !== B.FERN; },
+};
+const surface = (x, z) => { for (let y = 127; y > 0; y--) { const id = getBlock(x, y, z); if (id && id !== B.WATER && id !== B.OAK_LEAVES && id !== B.TALL_GRASS) return y; } return 0; };
+
+function findShore(x, z) {
+  for (let r = 16; r < 900; r += 16) {
+    for (let a = 0; a < 32; a++) {
+      const px = Math.round(x + Math.cos(a / 32 * Math.PI * 2) * r), pz = Math.round(z + Math.sin(a / 32 * Math.PI * 2) * r);
+      if (gen.heightAt(px, pz) < 44) return { x: px, z: pz };
+    }
+  }
+  return { x, z };
+}
+
+// Test props next to spawn: materials, lights, lava, glass.
+function buildProps(sx, sz) {
+  const y0 = surface(sx, sz);
+  const pad = (x0, z0, w, d, y) => { for (let x = x0; x < x0 + w; x++) for (let z = z0; z < z0 + d; z++) { setBlock(x, y, z, B.STONE_BRICKS); for (let yy = y + 1; yy < y + 7; yy++) setBlock(x, yy, z, 0); } };
+  pad(sx - 6, sz - 12, 13, 9, y0);
+  const y = y0 + 1;
+  const row = [B.GOLD_BLOCK, B.IRON_BLOCK, B.DIAMOND_BLOCK, B.GLASS, B.ICE, B.GLOWSTONE, B.OBSIDIAN, B.SEA_LANTERN, B.OAK_LEAVES];
+  row.forEach((id, i) => setBlock(sx - 5 + i + (i > 4 ? 1 : 0), y, sz - 11, id));
+  setBlock(sx - 4, y + 1, sz - 11, B.GLASS);
+  // lava pool
+  for (let x = sx + 1; x < sx + 4; x++) for (let z = sz - 8; z < sz - 6; z++) setBlock(x, y0, z, B.LAVA);
+  // torches and plants
+  setBlock(sx - 5, y, sz - 7, B.TORCH);
+  setBlock(sx + 5, y, sz - 5, B.TORCH);
+  setBlock(sx - 2, y, sz - 6, B.POPPY);
+  setBlock(sx - 1, y, sz - 6, B.TALL_GRASS);
+  setBlock(sx, y, sz - 6, B.DANDELION);
+  // a little wall with a window
+  for (let x = sx - 5; x <= sx - 2; x++) for (let yy = y; yy < y + 3; yy++) setBlock(x, yy, sz - 4, yy === y + 1 && x > sx - 5 && x < sx - 2 ? B.GLASS : B.OAK_PLANKS);
+  return { x: sx, y: y, z: sz - 8 };
+}
+
+// ---------------------------------------------------------------------------------------------
+const spawn = gen.findSpawn();
+const shore = findShore(spawn.x, spawn.z);
+const scenes = {
+  noon: { time: 0.25, pos: [spawn.x, spawn.y + 22, spawn.z], yaw: 0.6, pitch: -0.3 },
+  afternoon: { time: 0.41, pos: [spawn.x, spawn.y + 6, spawn.z], yaw: -1.2, pitch: -0.08 },
+  sunset: { time: 0.485, pos: [spawn.x, spawn.y + 12, spawn.z], yaw: -Math.PI / 2 + 0.3, pitch: 0.02 },
+  night: { time: 0.78, pos: [spawn.x, spawn.y + 3, spawn.z + 2], yaw: 0.0, pitch: -0.25, props: true },
+  props: { time: 0.3, pos: [spawn.x, spawn.y + 4, spawn.z + 1], yaw: 0.0, pitch: -0.4, props: true },
+  propslow: { time: 0.44, pos: [spawn.x + 1, spawn.y + 3, spawn.z], yaw: 0.25, pitch: -0.35, props: true },
+  water: { time: 0.33, pos: [shore.x, 64, shore.z], yaw: 0.3, pitch: -0.35 },
+  waterlow: { time: 0.46, pos: [shore.x, 60, shore.z], yaw: -Math.PI / 2 + 0.2, pitch: -0.12 },
+  underwater: { time: 0.3, pos: [shore.x, 50, shore.z], yaw: 0.3, pitch: 0.25, underwater: true },
+  held: { time: 0.3, pos: [spawn.x, spawn.y + 1.62, spawn.z + 1], yaw: 0.0, pitch: -0.5, props: true, held: true },
+  backlit: { time: 0.44, pos: [spawn.x + 6, spawn.y + 2, spawn.z], yaw: Math.PI / 2, pitch: 0.05 },
+  shallow: { time: 0.3, pos: [shore.x, 60, shore.z], yaw: -Math.PI / 2 + 0.2, pitch: -0.6 },
+  mats: { time: 0.36, pos: [spawn.x - 1, spawn.y + 2.6, spawn.z - 7.5], yaw: 0.35, pitch: -0.42, props: true, held: true },
+  held2: { time: 0.3, pos: [spawn.x + 2, spawn.y + 3.2, spawn.z - 6], yaw: 0.2, pitch: -0.45, props: true, held: true },
+};
+const sc = { ...scenes[SCENE] || scenes.noon };
+if (q.get('time')) sc.time = +q.get('time');
+if (q.get('yaw')) sc.yaw = +q.get('yaw');
+if (q.get('pitch')) sc.pitch = +q.get('pitch');
+if (q.get('y')) sc.pos = [sc.pos[0], +q.get('y'), sc.pos[2]];
+const props = sc.props ? buildProps(Math.floor(spawn.x), Math.floor(spawn.z)) : null;
+
+const settings = {
+  shadows: q.get('shadows') !== '0', shadowRes: +(q.get('shadowRes') || 2048), shadowRadius: +(q.get('radius') || 128),
+  pcss: q.get('pcss') !== '0', ssr: +(q.get('ssr') ?? 24), renderDistance: +(q.get('rd') || 4), clouds: 16,
+};
+
+
+const tex = buildTextures();
+const rs = { renderDistance: +(q.get('rd') || 4), renderScale: 1, shadows: q.get('shadows') !== '0', shadowRes: 2048, shadowRadius: 128,
+  pcss: q.get('pcss') !== '0', volumetrics: +(q.get('vol') ?? 12), clouds: +(q.get('clouds') ?? 12), ssr: +(q.get('ssr') ?? 24), bloom: true, fxaa: true };
+const renderer = new Renderer(document.getElementById('c'), tex, rs);
+const ccx = Math.floor(sc.pos[0] / 16), ccz = Math.floor(sc.pos[2] / 16), rd = rs.renderDistance;
+for (let dz = -rd; dz <= rd; dz++) for (let dx = -rd; dx <= rd; dx++) {
+  if (dx * dx + dz * dz > (rd + 0.5) * (rd + 0.5)) continue;
+  const nb = [];
+  for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) nb.push(chunk(ccx + dx + i, ccz + dz + j));
+  const m = meshChunk(nb, tex.faceLayers, ccx + dx, ccz + dz);
+  renderer.terrain.upload(ccx + dx, ccz + dz, { cx: ccx + dx, cz: ccz + dz, ...m });
+}
+const particles = new ParticleSystem(tex);
+let selection = null, held = null;
+if (sc.held) {
+  const so = (q.get('sel') || '-1,0,-3').split(',').map(Number);
+  selection = { x: props.x + so[0], y: props.y + so[1], z: props.z + so[2], id: getBlock(props.x + so[0], props.y + so[1], props.z + so[2]) };
+  held = { blockId: +(q.get('heldId') || B.GRASS), swing: +(q.get('swing') || 0), equip: 0, bobX: 0, bobY: 0, light: [1, 0] };
+}
+if (q.get('particles')) {
+  const p = props || { x: Math.floor(sc.pos[0]), y: Math.floor(sc.pos[1]) - 2, z: Math.floor(sc.pos[2]) - 3 };
+  particles.spawnBlockBreak(p.x - 2, p.y, p.z - 1, B.GRASS);
+  particles.spawnBlockBreak(p.x + 1, p.y, p.z - 1, B.GOLD_BLOCK);
+}
+const a = sc.time * Math.PI * 2, phi = 25 * Math.PI / 180;
+const sunDir = [Math.cos(a), Math.sin(a) * Math.cos(phi), Math.sin(a) * Math.sin(phi)];
+const frames = +(q.get('frames') || 30);
+let i = 0;
+const t0 = performance.now();
+function tick() {
+  const time = 100 + i / 30;
+  particles.update(1 / 30, worldView);
+  renderer.render({ camPos: sc.pos, yaw: sc.yaw, pitch: sc.pitch, fov: 70 * Math.PI / 180, time, dt: 1 / 30, timeOfDay: sc.time,
+    sunDir, moonDir: sunDir.map((v) => -v), underwater: !!sc.underwater, eyeSkyLight: sc.underwater ? 0.6 : 1,
+    selection, particles, held, cloudCoverage: 0.45 });
+  i++;
+  if (i < frames) requestAnimationFrame(tick);
+  else {
+    const e = renderer.gl.getError();
+    if (e) console.error('GL error 0x' + e.toString(16));
+    log('frames', frames, ((performance.now() - t0) / frames).toFixed(0), 'ms/frame', JSON.stringify(renderer.stats));
+    window.__done = true;
+  }
+}
+requestAnimationFrame(tick);
+</script>
