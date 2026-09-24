@@ -138,7 +138,7 @@ export class WorldGen {
 export function meshChunk(neighbors, faceLayers: Uint16Array): {
   opaque: Uint32Array, water: Uint32Array,      // packed vertices (4 words each, 4 vertices per quad)
   opaqueQuads: number, waterQuads: number,
-  minY: number, maxY: number,                   // vertical extent of emitted geometry (blocks)
+  minY: number, maxY: number,                   // geometry spans y in [minY, maxY) (maxY exclusive, blocks)
 }
 ```
 Lighting (Minecraft rules, computed over the 46 × 46 region = chunk ± 15 blocks, across all 9 chunks):

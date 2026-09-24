@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Texture timing</title>
+<script type="module">
+// Cold (first) and warm buildTextures timings in the browser.
+import { buildTextures } from '../../../src/textures.js';
+const t0 = performance.now();
+buildTextures();
+const cold = performance.now() - t0;
+const warm = [];
+for (let i = 0; i < 8; i++) { const a = performance.now(); buildTextures(); warm.push(performance.now() - a); }
+warm.sort((a, b) => a - b);
+console.log(`cold ${cold.toFixed(1)} ms, warm median ${warm[4].toFixed(1)} ms`);
+window.__done = true;
+</script>

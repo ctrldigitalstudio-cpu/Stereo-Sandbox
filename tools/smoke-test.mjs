@@ -2,7 +2,8 @@
 // End-to-end smoke test in headless Chromium (SwiftShader). Boots the game in test mode,
 // waits for terrain, then captures screenshots of several scenes and fails on any page error.
 //
-//   node tools/smoke-test.mjs [--dist] [--size 960x540] [--only name,name] [--out tools/out]
+//   node tools/smoke-test.mjs [--dist] [--size 960x540] [--only name,name] [--out tools/out] [--ui]
+// --ui: capture scenes with the HTML UI (page screenshots) instead of canvas grabs.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -38,7 +39,7 @@ log(`open ${url}`);
 await page.goto(url, { waitUntil: 'load' });
 await page.waitForFunction(() => window.__game, null, { timeout: 60000 });
 log('game object ready; waiting for terrain');
-await page.waitForFunction(() => window.__game.loaded(3) >= 1, null, { timeout: 240000, polling: 500 });
+await page.waitForFunction(() => window.__game.loaded(3) >= 1, null, { timeout: 600000, polling: 500 });
 const frames = (n) => page.evaluate((n) => new Promise((res) => {
   const start = window.__game.frame;
   const tick = () => (window.__game.frame - start >= n ? res() : requestAnimationFrame(tick));
@@ -48,8 +49,23 @@ await frames(20);
 log('terrain loaded');
 
 const want = (name) => !only || only.includes(name);
+
+// Software GL can make a single frame take seconds, so page screenshots may time out; the
+// canvas grab (read back right after a frame) always works but omits the HTML UI.
+async function shoot(file, withUI) {
+  if (withUI) {
+    try {
+      await page.screenshot({ path: file, timeout: 180000 });
+      return;
+    } catch (e) {
+      console.log(`[smoke] page screenshot failed (${e.message.split('\n')[0]}), using canvas grab`);
+    }
+  }
+  const url = await page.evaluate(() => window.__game.capture());
+  fs.writeFileSync(file, Buffer.from(url.split(',')[1], 'base64'));
+}
 if (want('title')) {
-  await page.screenshot({ path: path.join(outDir, 'smoke-title.png') });
+  await shoot(path.join(outDir, 'smoke-title.png'), true);
   log('title screenshot');
 }
 
@@ -100,7 +116,7 @@ for (const s of scenes) {
   }
   await frames(25);
   const file = path.join(outDir, `smoke-${s.name}.png`);
-  await page.screenshot({ path: file });
+  await shoot(file, args.includes('--ui'));
   const stats = await page.evaluate(() => JSON.stringify(window.__game.renderer.stats || {}));
   log(`${s.name}: ${file} ${stats}`);
 }

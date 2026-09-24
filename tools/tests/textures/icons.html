@@ -1,0 +1,207 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Textures harness</title>
+<style>
+  body { margin: 0; background: #1b1e24; color: #e8e4da; font: 11px/1.2 system-ui, sans-serif; }
+  #icons { display: grid; grid-template-columns: repeat(auto-fill, 76px); gap: 4px; padding: 8px; }
+  .cell { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .cell canvas { image-rendering: pixelated; background: #2a2e36; }
+  .cell span { width: 76px; text-align: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 9px; opacity: .8; }
+  #row { display: flex; gap: 8px; padding: 0 8px 8px; align-items: flex-start; }
+  #scene { width: 640px; height: 360px; image-rendering: pixelated; }
+  #small canvas { image-rendering: pixelated; }
+</style>
+<div id="icons"></div>
+<div id="row"><canvas id="scene" width="640" height="360"></canvas><div id="small"></div></div>
+<script type="module">
+import { buildTextures, makeBlockIcon, defaultTint } from '../../../src/textures.js';
+import { BLOCKS, SHAPE_NONE, SHAPE_CUBE, B } from '../../../src/blocks.js';
+import { FACES as VFACES, QUAD_UV } from '../../../src/vertex.js';
+import { mat4 } from '../../../src/math.js';
+
+const params = new URLSearchParams(location.search);
+const scene = params.get('scene') || 'grazing';
+const zoom = Number(params.get('zoom') || 1);
+if (zoom !== 1) document.getElementById('icons').style.gridTemplateColumns = `repeat(auto-fill, ${64 * zoom + 12}px)`;
+const t0 = performance.now();
+const tex = buildTextures();
+console.log(`buildTextures in browser: ${(performance.now() - t0).toFixed(1)} ms, ${tex.layers} layers`);
+
+// ---- Icons ------------------------------------------------------------------------------
+const t1 = performance.now();
+const grid = document.getElementById('icons');
+let count = 0;
+for (const d of BLOCKS) {
+  if (d.shape === SHAPE_NONE) continue;
+  const c = makeBlockIcon(tex, d.id, 64);
+  if (!(c instanceof HTMLCanvasElement) || c.width !== 64) console.error('bad icon for', d.name);
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  c.style.width = c.style.height = 64 * zoom + 'px';
+  cell.append(c);
+  const s = document.createElement('span');
+  s.textContent = d.label;
+  cell.append(s);
+  grid.append(cell);
+  count++;
+}
+console.log(`${count} icons in ${(performance.now() - t1).toFixed(1)} ms`);
+// Small sizes as the hotbar may use them, plus odd sizes
+const small = document.getElementById('small');
+for (const [id, size] of [[B.GRASS, 32], [B.OAK_LEAVES, 32], [B.GLASS, 32], [B.TORCH, 32], [B.GLOWSTONE, 40], [B.WATER, 48], [B.LAVA, 48], [B.POPPY, 24], [B.AIR, 32]]) {
+  const c = makeBlockIcon(tex, id, size);
+  c.style.width = c.style.height = size * 2 + 'px';
+  c.style.margin = '2px';
+  small.append(c);
+}
+
+// ---- WebGL2: upload exactly as the renderer will, then draw a lit preview -----------------
+const canvas = document.getElementById('scene');
+const gl = canvas.getContext('webgl2', { antialias: true });
+function uploadArray(levels, internal) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, tex.levels, internal, tex.size, tex.size, tex.layers);
+  for (let l = 0; l < tex.levels; l++) {
+    const s = tex.size >> l;
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, l, 0, 0, 0, s, s, tex.layers, gl.RGBA, gl.UNSIGNED_BYTE, levels[l]);
+  }
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  const an = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (an) gl.texParameterf(gl.TEXTURE_2D_ARRAY, an.TEXTURE_MAX_ANISOTROPY_EXT, 8);
+  return t;
+}
+const albedoT = uploadArray(tex.albedo, gl.SRGB8_ALPHA8);
+const normalT = uploadArray(tex.normal, gl.RGBA8);
+const specT = uploadArray(tex.spec, gl.RGBA8);
+let err = gl.getError();
+if (err) console.error('GL error after upload: 0x' + err.toString(16)); else console.log('texture arrays uploaded, no GL error');
+
+// Scene: a grass floor with one of every cube block in rows, plus plants and a torch.
+const verts = [];
+function quad(p, U, V, n, face, layer, tint, u0 = 0, v0 = 0, u1 = 1, v1 = 1, plant = 0) {
+  for (const [a, b] of QUAD_UV) {
+    const x = p[0] + U[0] * a + V[0] * b;
+    const y = p[1] + U[1] * a + V[1] * b;
+    const z = p[2] + U[2] * a + V[2] * b;
+    verts.push(x, y, z, u0 + a * (u1 - u0), v0 + b * (v1 - v0), layer, face, tint[0] / 255, tint[1] / 255, tint[2] / 255, plant);
+  }
+}
+function cube(x, y, z, id) {
+  const tint = defaultTint(id);
+  for (let f = 0; f < 6; f++) {
+    const F = VFACES[f];
+    quad([x + F.base[0], y + F.base[1], z + F.base[2]], F.U, F.V, F.n, f, tex.faceLayers[id * 6 + f], tint);
+  }
+}
+function cross(x, y, z, id) {
+  const L = tex.faceLayers[id * 6], tint = defaultTint(id);
+  const a = 2 / 16, b = 14 / 16;
+  quad([x + a, y + 1, z + a], [b - a, 0, b - a], [0, -1, 0], [0, 1, 0], 2, L, tint, 0, 0, 1, 1, 1);
+  quad([x + b, y + 1, z + b], [a - b, 0, a - b], [0, -1, 0], [0, 1, 0], 2, L, tint, 0, 0, 1, 1, 1);
+  quad([x + a, y + 1, z + b], [b - a, 0, a - b], [0, -1, 0], [0, 1, 0], 2, L, tint, 0, 0, 1, 1, 1);
+  quad([x + b, y + 1, z + a], [a - b, 0, b - a], [0, -1, 0], [0, 1, 0], 2, L, tint, 0, 0, 1, 1, 1);
+}
+for (let z = -30; z < 6; z++) for (let x = -14; x < 14; x++) cube(x, -1, z, B.GRASS);
+const cubes = BLOCKS.filter((d) => d.shape === SHAPE_CUBE && d.id !== B.GRASS);
+cubes.forEach((d, k) => {
+  const row = Math.floor(k / 12), col = k % 12;
+  cube(-11 + col * 2, 0, -3 - row * 3, d.id);
+  if (row === 0) cube(-11 + col * 2, 1, -3, d.id);
+});
+[B.TALL_GRASS, B.FERN, B.POPPY, B.DANDELION, B.CORNFLOWER, B.DEAD_BUSH, B.TALL_GRASS, B.FERN].forEach((id, k) => cross(-8 + k * 2, 0, -1, id));
+for (let x = -10; x <= 10; x += 2) cross(x, 0, -14, B.TALL_GRASS);
+// torch as a plain box using the mapped texels
+{
+  const L = tex.faceLayers[B.TORCH * 6];
+  const x = 9, z = -1, a = 7 / 16, b = 9 / 16, h = 10 / 16;
+  quad([x + b, h, z + b], [0, 0, a - b], [0, -h, 0], [1, 0, 0], 0, L, [255, 255, 255], 7 / 16, 6 / 16, 9 / 16, 1);
+  quad([x + a, h, z + a], [0, 0, b - a], [0, -h, 0], [-1, 0, 0], 1, L, [255, 255, 255], 7 / 16, 6 / 16, 9 / 16, 1);
+  quad([x + a, h, z + b], [b - a, 0, 0], [0, -h, 0], [0, 0, 1], 4, L, [255, 255, 255], 7 / 16, 6 / 16, 9 / 16, 1);
+  quad([x + b, h, z + a], [a - b, 0, 0], [0, -h, 0], [0, 0, -1], 5, L, [255, 255, 255], 7 / 16, 6 / 16, 9 / 16, 1);
+  quad([x + a, h, z + a], [b - a, 0, 0], [0, 0, b - a], [0, 1, 0], 2, L, [255, 255, 255], 7 / 16, 6 / 16, 9 / 16, 8 / 16);
+}
+const data = new Float32Array(verts);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+const quads = data.length / 44;
+const idx = new Uint32Array(quads * 6);
+for (let q = 0; q < quads; q++) idx.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3], q * 6);
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+
+const vs = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aUVL; layout(location=2) in float aFace;
+layout(location=3) in vec3 aTint; layout(location=4) in float aPlant;
+uniform mat4 uVP;
+out vec3 vUVL; flat out int vFace; out vec3 vTint; out vec3 vPos; flat out float vPlant;
+void main(){ vUVL = aUVL; vFace = int(aFace); vTint = aTint; vPos = aPos; vPlant = aPlant; gl_Position = uVP * vec4(aPos, 1.0); }`;
+const fs = `#version 300 es
+precision highp float; precision highp sampler2DArray;
+uniform sampler2DArray uA, uN, uS; uniform vec3 uSun; uniform vec3 uCam;
+in vec3 vUVL; flat in int vFace; in vec3 vTint; in vec3 vPos; flat in float vPlant; out vec4 o;
+const vec3 FN[6] = vec3[6](vec3(1,0,0), vec3(-1,0,0), vec3(0,1,0), vec3(0,-1,0), vec3(0,0,1), vec3(0,0,-1));
+const vec3 FT[6] = vec3[6](vec3(0,0,-1), vec3(0,0,1), vec3(1,0,0), vec3(1,0,0), vec3(1,0,0), vec3(-1,0,0));
+const vec3 FB[6] = vec3[6](vec3(0,-1,0), vec3(0,-1,0), vec3(0,0,1), vec3(0,0,-1), vec3(0,-1,0), vec3(0,-1,0));
+void main(){
+  vec4 a = texture(uA, vUVL);
+  if (a.a < 0.5) discard;
+  vec4 s = texture(uS, vUVL);
+  vec3 alb = a.rgb * mix(vec3(1.0), pow(vTint, vec3(2.2)), s.a);
+  vec3 tn = texture(uN, vUVL).xyz * 2.0 - 1.0;
+  vec3 N = vPlant > 0.5 ? vec3(0,1,0) : normalize(FT[vFace] * tn.x + FB[vFace] * tn.y + FN[vFace] * tn.z);
+  vec3 Ng = vPlant > 0.5 ? vec3(0,1,0) : FN[vFace];
+  vec3 L = normalize(uSun), V = normalize(uCam - vPos), H = normalize(L + V);
+  float ndl = max(dot(N, L), 0.0) * step(0.0, dot(Ng, L));
+  float rough = 1.0 - s.r; float a2 = pow(max(rough * rough, 0.02), 2.0);
+  float nh = max(dot(N, H), 0.0); float D = a2 / (3.14159 * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+  vec3 F0 = mix(vec3(0.04), alb, s.g);
+  vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+  vec3 sun = vec3(3.0, 2.6, 2.1);
+  vec3 col = alb * (1.0 - s.g) * (sun * ndl + vec3(0.35, 0.42, 0.55) * (0.6 + 0.4 * N.y)) + F * D * 0.25 * sun * ndl + alb * s.b * 4.0;
+  col = col / (1.0 + col) * 1.25;
+  o = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+}`;
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+const st = 44;
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, st, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, st, 12);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, st, 24);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 3, gl.FLOAT, false, st, 28);
+gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 1, gl.FLOAT, false, st, 40);
+const views = {
+  grazing: { eye: [0.5, 4.2, 6.5], at: [0.5, 0.2, -6], sun: [-0.7, 0.28, 0.35] },
+  noon: { eye: [0.5, 5, 7], at: [0.5, 0, -6], sun: [0.3, 1, 0.4] },
+  close: { eye: [-6, 2.2, 1.5], at: [-6, 0.6, -4], sun: [-0.6, 0.45, 0.6] },
+};
+const v = views[scene] || views.grazing;
+const proj = mat4.perspective(mat4.create(), 1.0, 640 / 360, 0.05, 200);
+const view = mat4.lookAt(mat4.create(), v.eye, v.at, [0, 1, 0]);
+gl.uniformMatrix4fv(gl.getUniformLocation(prog, 'uVP'), false, mat4.multiply(mat4.create(), proj, view));
+gl.uniform3fv(gl.getUniformLocation(prog, 'uSun'), v.sun);
+gl.uniform3fv(gl.getUniformLocation(prog, 'uCam'), v.eye);
+gl.uniform1i(gl.getUniformLocation(prog, 'uA'), 0);
+gl.uniform1i(gl.getUniformLocation(prog, 'uN'), 1);
+gl.uniform1i(gl.getUniformLocation(prog, 'uS'), 2);
+gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, albedoT);
+gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D_ARRAY, normalT);
+gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D_ARRAY, specT);
+gl.clearColor(0.55, 0.7, 0.9, 1);
+gl.enable(gl.DEPTH_TEST);
+gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+gl.drawElements(gl.TRIANGLES, quads * 6, gl.UNSIGNED_INT, 0);
+err = gl.getError();
+if (err) console.error('GL error after draw: 0x' + err.toString(16)); else console.log(`drew ${quads} quads, no GL error`);
+window.__done = true;
+</script>

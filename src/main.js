@@ -154,6 +154,7 @@ function boot() {
   let saveTimer = 0;
   let biomeName = '';
   let lastHotbarSig = '';
+  const captureWaiters = [];      // pending __game.capture() calls (tests)
 
   // Title-screen camera: a slow drift above the spawn area.
   const anchor = { x: player.pos[0], z: player.pos[2], y: player.pos[1] };
@@ -362,6 +363,12 @@ function boot() {
       cloudCoverage: settings.cloudCoverage,
     });
 
+    if (captureWaiters.length) {
+      // Read the canvas in the same task as the draw (no preserveDrawingBuffer needed).
+      const url = canvas.toDataURL('image/png');
+      for (const resolve of captureWaiters.splice(0)) resolve(url);
+    }
+
     if (sound.setListener) sound.setListener(camPos, yaw);
     if (sound.ambient && frameIndex % 15 === 0) sound.ambient(timeOfDay, underwater, eyeSkyLight);
 
@@ -432,6 +439,7 @@ function boot() {
       if (patch.renderScale) dynScale = patch.renderScale;
     },
     loaded: (r = 3) => world.loadedFraction(r),
+    capture: () => new Promise((resolve) => captureWaiters.push(resolve)),
   };
 
   requestAnimationFrame(frame);

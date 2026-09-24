@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Worldgen in-game check</title>
+<link rel="stylesheet" href="../../../style.css">
+<script>
+  // Cheap settings so SwiftShader can render the real pipeline; scene chosen by query params.
+  localStorage.setItem('blockvale.settings.v1', JSON.stringify({
+    preset: 'custom', renderDistance: 5, renderScale: 0.6, autoResolution: false, shadows: true, shadowRes: 1024,
+    shadowRadius: 64, pcss: false, volumetrics: 0, clouds: 0, ssr: 8, bloom: true, fxaa: false, dayLength: 0,
+  }));
+  const q = new URLSearchParams(location.search);
+  window.addEventListener('load', () => {
+    const tick = () => {
+      const g = window.__game;
+      if (!g || g.loaded(2) < 1) { setTimeout(tick, 500); return; }
+      g.play();
+      const s = g.gen.findSpawn();
+      const x = Number(q.get('x') ?? s.x), z = Number(q.get('z') ?? s.z);
+      const y = Number(q.get('y') ?? (g.gen.heightAt(x, z) + Number(q.get('up') ?? 8)));
+      g.teleport(x, y, z, Number(q.get('yaw') ?? 0.6), Number(q.get('pitch') ?? -0.15));
+      g.setTime(Number(q.get('t') ?? 0.3));
+      const wait = () => {
+        if (g.loaded(3) < 1) { setTimeout(wait, 500); return; }
+        const f0 = g.frame;
+        // Grab the canvas right after a rendered frame (same task, so the drawing buffer is valid).
+        const raf = window.requestAnimationFrame.bind(window);
+        window.requestAnimationFrame = (cb) => raf((t) => {
+          cb(t);
+          if (!window.__done && g.frame - f0 > 12) {
+            window.__shot = document.getElementById('game').toDataURL('image/png');
+            window.__done = true;
+          }
+        });
+      };
+      setTimeout(wait, 500);
+    };
+    tick();
+  });
+</script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui"></div>
+<script type="module" src="../../../src/main.js"></script>
+</body>
+</html>
