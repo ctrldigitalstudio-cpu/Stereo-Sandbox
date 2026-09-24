@@ -219,6 +219,7 @@ function boot() {
   const ui = new UI({
     textures,
     settings,
+    sound,
     onSettingsChange(next) {
       const scaleChanged = next.renderScale !== settings.renderScale;
       settings = TEST ? { ...next, autoResolution: false } : next;

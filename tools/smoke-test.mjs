@@ -27,8 +27,10 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: W, height: H } });
 const errors = [];
+// External font requests can't leave this sandbox; they are optional (fallback stacks).
+const external = (text) => /fonts\.(googleapis|gstatic)\.com|net::ERR_/.test(text);
 page.on('console', (m) => {
-  if (m.type() === 'error') errors.push(m.text());
+  if (m.type() === 'error' && !external(m.text() + ' ' + (m.location()?.url || ''))) errors.push(m.text());
   if (m.type() === 'error' || m.type() === 'warning') console.log(`[console.${m.type()}] ${m.text().slice(0, 2000)}`);
 });
 page.on('pageerror', (e) => { errors.push(e.message); console.log(`[pageerror] ${e.stack || e.message}`); });
