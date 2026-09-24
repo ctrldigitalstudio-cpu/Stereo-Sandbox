@@ -330,7 +330,7 @@ async function selftest() {
   document.getElementById('setting-shadows').click();
   ok(calls.settings.at(-1).shadows === true && !document.querySelector('[data-key="pcss"]').classList.contains('is-disabled'), 'toggle switch applies and re-enables dependants');
   let stored = null;
-  try { stored = JSON.parse(localStorage.getItem('blockvale.settings.v1')); } catch (e) { /* ignore */ }
+  try { stored = JSON.parse(localStorage.getItem('stereo-sandbox.settings.v1')); } catch (e) { /* ignore */ }
   ok(stored && stored.shadows === true && stored.preset === 'custom', 'settings saved with saveSettings()');
   const n = calls.settings.length;
   document.getElementById('setting-shadows').click();

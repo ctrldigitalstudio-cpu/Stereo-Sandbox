@@ -27,7 +27,7 @@ page.on('console', (m) => {
   if (m.type() === 'error') { errors.push(m.text()); console.log(`[console.error] ${m.text().slice(0, 500)}`); }
 });
 page.on('pageerror', (e) => { errors.push(e.message); console.log(`[pageerror] ${e.stack || e.message}`); });
-await page.addInitScript((s) => { localStorage.setItem('blockvale.settings.v1', JSON.stringify(s)); }, settings);
+await page.addInitScript((s) => { localStorage.setItem('stereo-sandbox.settings.v1', JSON.stringify(s)); }, settings);
 
 const t0 = Date.now();
 const log = (s) => console.log(`[${((Date.now() - t0) / 1000).toFixed(0)}s] ${s}`);

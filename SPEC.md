@@ -1,4 +1,4 @@
-# Blockvale — technical spec
+# Stereo Sandbox — technical spec
 
 A Minecraft-style voxel sandbox in the browser. Plain ES modules + WebGL2, no runtime
 dependencies. The goal is gameplay that feels like creative-mode Minecraft, rendered with
@@ -387,7 +387,7 @@ export class UI {
   menuOpen: boolean     // any overlay that should block gameplay input
 }
 ```
-- Title screen over the live, slowly drifting 3D world: game name "Blockvale", subtitle
+- Title screen over the live, slowly drifting 3D world: game name "Stereo Sandbox", subtitle
   "A voxel sandbox", Play button (disabled with progress while loading), Settings, controls cheat-sheet,
   a note on phones that keyboard + mouse are needed.
 - Pause menu (Esc / pointer lock lost): Resume, Settings, New world, Controls.

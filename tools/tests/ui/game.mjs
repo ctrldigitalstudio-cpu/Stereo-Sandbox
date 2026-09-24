@@ -34,7 +34,7 @@ await ctx.route(/fonts\.(googleapis|gstatic)\.com/, async (route) => {
   } catch (e) { await route.abort(); }
 });
 await ctx.addInitScript(() => {
-  localStorage.setItem('blockvale.settings.v1', JSON.stringify({
+  localStorage.setItem('stereo-sandbox.settings.v1', JSON.stringify({
     preset: 'low', renderDistance: 4, renderScale: 0.5, shadows: false, volumetrics: 0, clouds: 0, ssr: 0, fxaa: false, autoResolution: false,
   }));
 });
