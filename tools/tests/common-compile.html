@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+import { createGL, Program } from '../../src/gl.js';
+import { GLSL_COMMON, GLSL_BLOCK_VERTEX, FULLSCREEN_VS, FULLSCREEN_FAR_VS, FrameUniforms, computeShadowMatrix } from '../../src/render/common.js';
+const gl = createGL(document.getElementById('c'));
+const fs = GLSL_COMMON + `
+in vec2 vUV; out vec4 o;
+void main(){
+  vec3 p = positionFromDepth(vUV, 0.5);
+  vec3 sc = shadowCoord(p);
+  float s = texture(uShadowCmp, sc) + texture(uShadowRaw, sc.xy).r + shadowTexelWorld(sc.xy);
+  vec3 c = applyFog(sampleSky(skyLutDir(vUV)), p, 1.0) + ambientLight(vec3(0,1,0)) + lightColor() + sunDiskRadiance();
+  c += texture(uAlbedo, vec3(vUV, 0.0)).rgb + texture(uNormals, vec3(vUV,0.0)).rgb + texture(uSpecular, vec3(vUV,0.0)).rgb;
+  c += texture(uNoise3D, vec3(vUV, 0.0)).r * cloudShadow(p) * henyeyGreenstein(0.5, 0.6) * ignFrame(gl_FragCoord.xy) * linearDepth(0.5);
+  o = vec4(c * s * luminance(c), 1.0);
+}`;
+const vs2 = GLSL_COMMON + GLSL_BLOCK_VERTEX + `
+out vec3 v;
+void main(){ v = blockLocalPos() + vec3(blockUV(), float(blockFlags() + blockLayer() + blockNormal())) * blockAO() + vec3(blockLight(), 0.0) + blockTint() + FACE_N[0] + FACE_T[1] + FACE_B[2]; gl_Position = uViewProj * vec4(v, 1.0); }`;
+const fs2 = GLSL_COMMON + `in vec3 v; out vec4 o; void main(){ o = vec4(v, 1.0); }`;
+try {
+  new Program(gl, FULLSCREEN_VS, fs, 'common-fs');
+  new Program(gl, FULLSCREEN_FAR_VS, fs, 'common-far');
+  new Program(gl, vs2, fs2, 'block-vertex');
+  const f = new FrameUniforms(gl); f.upload();
+  const sm = computeShadowMatrix([10.5, 70, -3.2], [0.5, 0.7, 0.3], 128);
+  console.log('OK', sm.center.join(','), Array.from(sm.matrix).map(v=>v.toFixed(3)).join(' '));
+} catch (e) { console.error(e.message); }
+window.__done = true;
+</script>
