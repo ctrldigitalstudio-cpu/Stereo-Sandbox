@@ -28,7 +28,9 @@ function createBlockArray(gl, set, levelsData, internal) {
     const s = Math.max(1, set.size >> l);
     gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, l, 0, 0, 0, s, s, set.layers, gl.RGBA, gl.UNSIGNED_BYTE, levelsData[l]);
   }
-  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  // LINEAR on purpose: shaders snap magnified lookups themselves (pixelArtUV in common.js),
+  // because NEAREST magnification is ignored by some drivers once anisotropy is enabled.
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_BASE_LEVEL, 0);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAX_LEVEL, levels - 1);

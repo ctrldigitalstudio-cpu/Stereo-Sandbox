@@ -136,6 +136,22 @@ float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float ignFrame(vec2 p) { return ign(p + 5.588238 * mod(uEnv.y, 64.0)); }
 
+// ---- Pixel-art texturing -----------------------------------------------------------------
+// Block textures use LINEAR magnification + anisotropic minification. D3D11 (Chrome on Windows)
+// and some Vulkan drivers can't combine NEAREST magnification with anisotropy (they silently
+// switch to bilinear), so crispness is produced here instead: when a texel covers more than a
+// pixel, snap the lookup to the texel centre, leaving a one-pixel anti-aliased seam between
+// texels. Pass the ORIGINAL uv gradients to textureGrad so mip/anisotropy selection is unchanged.
+// clampTexels keeps magnified lookups inside the 16x16 tile (no bleed from the opposite edge).
+vec2 pixelArtUV(vec2 uv, bool clampTexels) {
+  vec2 t = uv * 16.0;
+  vec2 d = max(fwidth(t), vec2(1e-5));
+  vec2 seam = floor(t + 0.5);
+  vec2 s = seam + clamp((t - seam) / min(d, vec2(1.0)), -0.5, 0.5);
+  if (clampTexels) s = mix(s, clamp(s, vec2(0.5), vec2(15.5)), step(d, vec2(1.0)));
+  return s / 16.0;
+}
+
 // ---- Depth -------------------------------------------------------------------------------
 float linearDepth(float d) {
   float z = d * 2.0 - 1.0;
@@ -215,7 +231,7 @@ float cloudShadow(vec3 worldPos) {
 // Exponential height fog toward the sky colour, plus a hard fade near the render distance so
 // chunk loading is hidden. skyLight (0..1) of the shaded point keeps cave fog dark.
 float heightFogAmount(float dist, float dirY) {
-  float a = 0.0021 * uWind.w;
+  float a = 0.0017 * uWind.w;
   float b = 0.035;
   float camH = max(uCamPos.y - SEA_LEVEL, -20.0);
   float k = dirY * b * dist;

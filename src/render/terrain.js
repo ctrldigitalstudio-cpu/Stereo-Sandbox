@@ -275,7 +275,7 @@ void main() {
     uv += n1 * 0.55 + n2 * 0.18 + vec2(t * 0.013, t * 0.021);
     uv = fract(uv); // derivatives come from the unwrapped uv, so no seams at the wrap
   }
-  vec3 tc = vec3(uv, float(vLayer));
+  vec3 tc = vec3(pixelArtUV(uv, !lava), float(vLayer));
   vec4 albedo = textureGrad(uAlbedo, tc, gx, gy);
   if (albedo.a < 0.5) discard;
   vec4 spec = textureGrad(uSpecular, tc, gx, gy);
@@ -402,7 +402,7 @@ in vec2 vUV;
 flat in uint vLayer;
 out vec4 fragColor;
 void main() {
-  if (texture(uAlbedo, vec3(vUV, float(vLayer))).a < 0.5) discard;
+  if (textureGrad(uAlbedo, vec3(pixelArtUV(vUV, true), float(vLayer)), dFdx(vUV), dFdy(vUV)).a < 0.5) discard;
   fragColor = vec4(1.0);
 }
 `;

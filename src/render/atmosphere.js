@@ -567,7 +567,7 @@ export class Atmosphere {
     // Fog: a little denser at dawn/dusk (morning haze) and at night.
     const dawnDusk = Math.exp(-((sun[1] / 0.2) ** 2));
     const night = smoothstep(0.05, -0.25, sun[1]);
-    const fogDensity = 1.0 + 1.1 * dawnDusk + 0.5 * night;
+    const fogDensity = 1.0 + 0.45 * dawnDusk + 0.3 * night;
 
     this.state = {
       timeOfDay: t,
