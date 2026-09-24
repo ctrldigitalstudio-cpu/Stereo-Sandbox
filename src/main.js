@@ -9,7 +9,7 @@ import { Input } from './input.js';
 import { Sound } from './audio.js';
 import { UI } from './ui.js';
 import { ParticleSystem } from './particles.js';
-import { loadSettings } from './config.js';
+import { loadSettings, QUALITY_PRESETS } from './config.js';
 import { B, BLOCKS, DEFAULT_HOTBAR, OPAQUE, EMIT, HEIGHT } from './blocks.js';
 import { clamp } from './math.js';
 
@@ -95,7 +95,14 @@ function nearbyBlockLight(world, p) {
 function boot() {
   const canvas = document.getElementById('game');
   let settings = loadSettings();
-  if (TEST) settings = { ...settings, autoResolution: false };
+  // Headless tests render in software: default to settings that keep a frame under a few seconds.
+  // ?test&preset=high (etc.) tests a real preset instead.
+  if (TEST) {
+    const preset = QUALITY_PRESETS[params.get('preset')];
+    settings = preset
+      ? { ...settings, ...preset, preset: params.get('preset'), autoResolution: false }
+      : { ...settings, autoResolution: false, renderDistance: 6, shadowRes: 1024, shadowRadius: 64, volumetrics: 12, clouds: 10, ssr: 16 };
+  }
 
   const textures = buildTextures();
   let renderer;
@@ -156,17 +163,20 @@ function boot() {
   let lastHotbarSig = '';
   const captureWaiters = [];      // pending __game.capture() calls (tests)
 
-  // Title-screen camera: a slow drift above the spawn area.
+  // Title-screen camera: a slow pan above the spawn area, starting just left of the sun so the
+  // golden-hour light rakes across the terrain and swings past the sun after ~40 s.
   const anchor = { x: player.pos[0], z: player.pos[2], y: player.pos[1] };
   let top = anchor.y;
-  for (let dz = -16; dz <= 16; dz += 4) {
-    for (let dx = -16; dx <= 16; dx += 4) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
+  for (let dz = -24; dz <= 24; dz += 3) {
+    for (let dx = -24; dx <= 24; dx += 3) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
   }
-  anchor.y = Math.min(HEIGHT + 20, Math.max(anchor.y + 9, top + 5));
-  const titleCam = { pos: [anchor.x, anchor.y, anchor.z], yaw: player.yaw, pitch: -0.12 };
+  anchor.y = Math.min(HEIGHT + 24, top + 14); // clears the tallest trees (~12 blocks)
+  const sun0 = sunDirection(timeOfDay);
+  const sunYaw = Math.atan2(-sun0[0], -sun0[2]); // yaw whose forward vector points at the sun
+  const titleCam = { pos: [anchor.x, anchor.y, anchor.z], yaw: sunYaw - 0.75, pitch: -0.14 };
   function updateTitleCamera(t) {
-    titleCam.yaw = player.yaw + t * 0.018;
-    titleCam.pitch = -0.13 + 0.035 * Math.sin(t * 0.05);
+    titleCam.yaw = sunYaw - 0.75 + t * 0.018;
+    titleCam.pitch = -0.15 + 0.035 * Math.sin(t * 0.05);
     titleCam.pos = [anchor.x + Math.sin(t * 0.011) * 5, anchor.y + Math.sin(t * 0.07) * 0.6, anchor.z + Math.cos(t * 0.009) * 5];
   }
 

@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>sky-post harness</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+<script>
+  // ?mock swaps the real terrain/overlays for harness mocks (isolates the renderer, atmosphere and post).
+  if (new URLSearchParams(location.search).has('mock')) {
+    const s = document.createElement('script');
+    s.type = 'importmap';
+    s.textContent = JSON.stringify({ imports: {
+      '/src/render/terrain.js': '/tools/tests/sky-post/mock-terrain.js',
+      '/src/render/overlays.js': '/tools/tests/sky-post/mock-overlays.js',
+    } });
+    document.head.appendChild(s);
+  }
+</script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script type="module" src="harness.js"></script>
+</body>
+</html>
