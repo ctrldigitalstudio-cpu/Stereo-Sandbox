@@ -1,14 +1,15 @@
-# Blockvale
+# Stereo Sandbox
 
-A Minecraft-style voxel sandbox that runs in the browser, rendered with a hand-written
-WebGL2 pipeline that aims for "shader pack" quality. No game engine, no runtime
-dependencies, no downloaded assets: every texture, sound, and chunk of terrain is
-generated in code.
+A voxel world to build in, right in the browser: a Minecraft-style sandbox rendered with a
+hand-written WebGL2 pipeline that aims for "shader pack" quality. No game engine, no runtime
+dependencies, no downloaded assets: every texture, sound, and chunk of terrain is generated
+in code.
 
 ## Play
 
 - **Single file:** open `dist/index.html` in a desktop browser (Chrome, Edge, Firefox, Safari 15+).
-  It works from disk, and from any static host.
+  It works from disk, from any static host, and embedded in a sandboxed iframe (without pointer
+  lock you look around by dragging with the mouse; without storage it simply doesn't save).
 - **From source:** `npm run serve`, then open <http://localhost:8080/>.
 
 A keyboard and mouse are needed.
@@ -26,8 +27,9 @@ A keyboard and mouse are needed.
 | Hide HUD / debug info | F1 / F3 |
 | Pause and settings | Esc |
 
-Your world, edits, position and hotbar save automatically in the browser (localStorage).
-"New world" in the pause menu starts over with a fresh seed.
+Your world, edits, position, hotbar and time of day save automatically in the browser
+(localStorage, every 10 s, when you pause and when you leave the page); saves from before the
+rename to Stereo Sandbox carry over. "New world" in the pause menu starts over with a fresh seed.
 
 ## Graphics
 
@@ -60,9 +62,18 @@ chunks.
 
 ```sh
 npm install
-npm run build     # -> dist/index.html (single self-contained file)
+npm run build     # -> dist/index.html (single self-contained file) + dist/artifact.html
 npm test          # headless Chromium smoke test, screenshots in tools/out/
+node tools/tests/gameplay/run-all.mjs   # play-through tests with real input (see below)
 ```
+
+`tools/tests/gameplay/` drives the real game with Playwright keyboard and mouse events: the
+whole journey from the title screen through movement, building, the inventory and every setting,
+saving and loading, edits across chunk borders, the title camera, sandboxed iframes, the
+single-file build (HTTP, `file://`, artifact), missing WebGL2, a host CSP that blocks workers
+(the world then runs on the page), hanging web fonts, touch-only devices, adaptive resolution
+under a 30 Hz cap, tiny and resized windows, two tabs on one save, and a race-condition fuzz
+test of the world worker protocol (`world-sync.test.mjs`, plain node).
 
 ## Layout
 

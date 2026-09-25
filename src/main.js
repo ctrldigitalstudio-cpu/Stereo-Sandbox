@@ -13,11 +13,17 @@ import { loadSettings, QUALITY_PRESETS } from './config.js';
 import { B, BLOCKS, DEFAULT_HOTBAR, OPAQUE, EMIT, HEIGHT } from './blocks.js';
 import { clamp } from './math.js';
 
-const SAVE_KEY = 'blockvale.save.v1';
+const SAVE_KEY = 'stereo-sandbox.save.v1';
+const LEGACY_SAVE_KEY = 'blockvale.save.v1';   // saves from before the rename to Stereo Sandbox (read-only)
 const params = new URLSearchParams(location.search);
 const TEST = params.has('test');
 const SUN_TILT = (25 * Math.PI) / 180;
 const START_TIME = 0.4; // mid-afternoon: the first sunset arrives a couple of minutes in
+const media = (q) => typeof matchMedia === 'function' && matchMedia(q).matches;
+// No mouse or trackpad at all (phones, tablets): there are no touch controls yet.
+const TOUCH_ONLY = media('(any-pointer: coarse)') && !media('(any-pointer: fine)');
+const REDUCED_MOTION = media('(prefers-reduced-motion: reduce)');
+const SESSION = Math.random().toString(36).slice(2, 10);   // tells this tab's saves from other tabs'
 
 function sunDirection(timeOfDay) {
   const a = timeOfDay * Math.PI * 2;
@@ -26,28 +32,35 @@ function sunDirection(timeOfDay) {
 
 function loadSave() {
   try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const raw = localStorage.getItem(SAVE_KEY) || localStorage.getItem(LEGACY_SAVE_KEY);
+    const save = raw ? JSON.parse(raw) : null;
+    return save && typeof save === 'object' ? save : null;
   } catch (e) {
     return null;
   }
 }
 
+// Returns null when saved, else the error (storage full, or blocked in an opaque sandbox).
 function writeSave(data) {
   try {
     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-  } catch (e) { /* storage full or blocked: the game keeps running */ }
+    return null;
+  } catch (e) {
+    return e || new Error('save failed');   // the game keeps running either way
+  }
 }
 
 function clearSave() {
+  // Both keys: a leftover legacy save would otherwise be picked up again as the "new" world.
   try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
+  try { localStorage.removeItem(LEGACY_SAVE_KEY); } catch (e) { /* ignore */ }
 }
 
 function fatal(message, detail) {
   const el = document.createElement('div');
   el.className = 'fatal-error';
   el.setAttribute('role', 'alert');
-  el.innerHTML = '<h1>Blockvale can\'t start</h1><p></p><pre></pre>';
+  el.innerHTML = '<h1>Stereo Sandbox can\'t start</h1><p></p><pre></pre>';
   el.querySelector('p').textContent = message;
   el.querySelector('pre').textContent = detail || '';
   Object.assign(el.style, {
@@ -123,6 +136,7 @@ function boot() {
     edits: save ? World.importEdits(save.edits) : new Map(),
     onMesh: (cx, cz, msg) => renderer.terrain.upload(cx, cz, msg),
     onUnload: (cx, cz) => renderer.terrain.remove(cx, cz),
+    onFallback: () => console.warn('World worker unavailable here: generating terrain on the page instead (slower).'),
   });
 
   const input = new Input(canvas);
@@ -131,12 +145,12 @@ function boot() {
   const particles = new ParticleSystem(textures);
 
   const spawn = gen.findSpawn();
-  if (save && save.player) {
-    const s = save.player;
-    player.pos = [s.x, s.y, s.z];
-    player.yaw = s.yaw || 0;
-    player.pitch = s.pitch || 0;
-    player.flying = !!s.flying;
+  const sp = save && save.player;
+  if (sp && [sp.x, sp.y, sp.z].every(Number.isFinite)) {
+    player.pos = [sp.x, clamp(sp.y, 1, HEIGHT + 64), sp.z];
+    player.yaw = Number.isFinite(sp.yaw) ? sp.yaw : 0;
+    player.pitch = Number.isFinite(sp.pitch) ? clamp(sp.pitch, -1.57, 1.57) : 0;
+    player.flying = !!sp.flying;
   } else {
     player.pos = [spawn.x, spawn.y, spawn.z];
     player.yaw = 0.6;
@@ -157,49 +171,100 @@ function boot() {
   let frameIndex = 0;
   let eyeSkyLight = 1, eyeSkyTarget = 1, blockLight = 0;
   let dynScale = settings.renderScale;
+  let redraw = true, lastDraw = -1;   // paused: draw only now and then
+  let probe = null, holdUntil = 0, holdoff = 0;   // adaptive resolution (see adaptResolution)
   let slowTime = 0, fastTime = 0;
   let saveTimer = 0;
+  let discarded = false;          // "New world": nothing may re-save the old world while the page unloads
   let biomeName = '';
   let lastHotbarSig = '';
   const captureWaiters = [];      // pending __game.capture() calls (tests)
+  let skipRender = false;         // tests: simulate without drawing (software GL takes seconds per frame)
+  const lastCam = { pos: [0, 0, 0], yaw: 0, pitch: 0 };
 
-  // Title-screen camera: a slow pan above the spawn area, starting just left of the sun so the
-  // golden-hour light rakes across the terrain and swings past the sun after ~40 s.
-  const anchor = { x: player.pos[0], z: player.pos[2], y: player.pos[1] };
-  let top = anchor.y;
-  for (let dz = -24; dz <= 24; dz += 3) {
-    for (let dx = -24; dx <= 24; dx += 3) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
+  // Title-screen camera: a slow pan above the player's area (spawn in a new world), starting just
+  // left of the sun so the golden-hour light rakes across the terrain and swings past the sun
+  // after ~40 s. Re-aimed when the player quits to the title, so the world there is already loaded.
+  const anchor = { x: 0, y: 0, z: 0 };
+  let sunYaw = 0, titleT0 = 0;
+  function aimTitleCamera() {
+    anchor.x = player.pos[0];
+    anchor.z = player.pos[2];
+    let top = player.pos[1];
+    for (let dz = -24; dz <= 24; dz += 3) {
+      for (let dx = -24; dx <= 24; dx += 3) top = Math.max(top, gen.heightAt(Math.floor(anchor.x + dx), Math.floor(anchor.z + dz)) + 1);
+    }
+    anchor.y = Math.min(HEIGHT + 24, top + 14); // clears the tallest trees (~12 blocks)
+    const sun = sunDirection(timeOfDay);
+    sunYaw = Math.atan2(-sun[0], -sun[2]);     // yaw whose forward vector points at the sun
   }
-  anchor.y = Math.min(HEIGHT + 24, top + 14); // clears the tallest trees (~12 blocks)
-  const sun0 = sunDirection(timeOfDay);
-  const sunYaw = Math.atan2(-sun0[0], -sun0[2]); // yaw whose forward vector points at the sun
-  const titleCam = { pos: [anchor.x, anchor.y, anchor.z], yaw: sunYaw - 0.75, pitch: -0.14 };
-  function updateTitleCamera(t) {
-    titleCam.yaw = sunYaw - 0.75 + t * 0.018;
-    titleCam.pitch = -0.15 + 0.035 * Math.sin(t * 0.05);
-    titleCam.pos = [anchor.x + Math.sin(t * 0.011) * 5, anchor.y + Math.sin(t * 0.07) * 0.6, anchor.z + Math.cos(t * 0.009) * 5];
+  aimTitleCamera();
+  function titleCameraAt(t) {
+    return {
+      // Reduced motion: only the slow pan remains (no bobbing, no pitch sway).
+      pos: [anchor.x + Math.sin(t * 0.011) * 5, anchor.y + (REDUCED_MOTION ? 0 : Math.sin(t * 0.07) * 0.6), anchor.z + Math.cos(t * 0.009) * 5],
+      yaw: sunYaw - 0.75 + t * 0.018,
+      pitch: -0.15 + (REDUCED_MOTION ? 0 : 0.035 * Math.sin(t * 0.05)),
+    };
   }
 
+  // Two tabs with the same world would overwrite each other's edits (last writer wins). Every
+  // save carries a revision and this tab's id; a tab that finds a newer revision from another tab
+  // stops saving instead of clobbering it, and says so. Unchanged state isn't rewritten, so a tab
+  // merely left open in the background never takes over the save.
+  let saveRev = save && Number.isFinite(save.rev) ? save.rev : 0;
+  let lastSaved = null, saveFullWarned = false, saveConflict = false;
   function saveGame() {
-    if (TEST) return;
-    writeSave({
+    if (TEST || discarded || saveConflict) return;
+    const data = {
       seed,
       time: timeOfDay,
       player: { x: player.pos[0], y: player.pos[1], z: player.pos[2], yaw: player.yaw, pitch: player.pitch, flying: player.flying },
       hotbar: player.hotbar,
       selected: player.selected,
       edits: world.exportEdits(),
-    });
+    };
+    const sig = JSON.stringify({ ...data, time: 0 });
+    if (sig === lastSaved) return;
+    const stored = loadSave();
+    if (stored && stored.sid !== SESSION && ((stored.rev || 0) > saveRev || stored.seed !== seed)) {
+      saveConflict = true;
+      ui.toast('This world was saved from another tab or window. Reload to continue from there; this tab won\'t save over it.', 10000);
+      return;
+    }
+    data.rev = saveRev + 1;
+    data.sid = SESSION;
+    const err = writeSave(data);
+    if (!err) { saveRev = data.rev; lastSaved = sig; }
+    // Blocked storage (sandbox) means saving is simply off; a full one would lose work silently.
+    if (err && /quota/i.test(`${err.name} ${err.message}`) && !saveFullWarned) {
+      saveFullWarned = true;
+      ui.toast('This browser\'s storage is full, so the world can\'t be saved right now.', 8000);
+    }
   }
 
+  let lockHintShown = false;
   function requestPlayLock() {
     sound.resume();
     input.requestLock().then((ok) => {
-      if (!ok && !TEST && !input.locked) ui.toast('Mouse capture is blocked here. Drag with the mouse to look around.');
+      // Once per session: in a sandboxed frame every resume fails the same way.
+      if (!ok && !TEST && !input.locked && !lockHintShown) {
+        lockHintShown = true;
+        ui.toast('Mouse capture is blocked here. Drag with the mouse to look around.');
+      }
     });
   }
 
+  // The second click of a double-clicked Play / Resume / Done lands on the canvas once the menu is
+  // gone: don't let it break a block the moment the game starts.
+  const DOUBLE_CLICK_MS = 400;
+
   function startPlaying() {
+    if (TOUCH_ONLY && !TEST) {
+      ui.toast('Stereo Sandbox needs a keyboard and mouse to play. Until then, enjoy the view.');
+      return;
+    }
+    input.suppressClicks(DOUBLE_CLICK_MS);
     state = 'playing';
     ui.hideTitle();
     ui.hidePause();
@@ -209,6 +274,7 @@ function boot() {
   function pause() {
     if (state !== 'playing') return;
     state = 'paused';
+    input.cancelLock();          // a delayed lock retry must not capture the mouse over the menu
     if (document.pointerLockElement) document.exitPointerLock();
     if (ui.inventoryOpen) ui.toggleInventory(false);
     ui.showPause();
@@ -217,6 +283,7 @@ function boot() {
 
   function openInventory() {
     ignoreUnlock = true;
+    input.cancelLock();
     ui.toggleInventory(true);
     if (document.pointerLockElement) document.exitPointerLock();
   }
@@ -236,24 +303,29 @@ function boot() {
     onSettingsChange(next) {
       const scaleChanged = next.renderScale !== settings.renderScale;
       settings = TEST ? { ...next, autoResolution: false } : next; // the UI persists `next` itself
-      if (scaleChanged || !settings.autoResolution) dynScale = settings.renderScale;
+      if (scaleChanged || !settings.autoResolution) { dynScale = settings.renderScale; probe = null; }
       renderer.applySettings({ ...settings, renderScale: Math.min(dynScale, settings.renderScale) });
       applyAudioSettings();
+      redraw = true;
     },
     onPlay: startPlaying,
     onResume: startPlaying,
     onNewWorld() {
+      discarded = true;             // pagehide / visibilitychange during the reload would write it back
       clearSave();
       world.terminate();
       location.reload();
     },
     onQuit() {
+      input.cancelLock();
       saveGame();
+      aimTitleCamera();
+      titleT0 = time;
       state = 'title';
       ui.hidePause();
       ui.showTitle();
     },
-    onInventoryClose: () => closeInventory(),
+    onInventoryClose: () => { input.suppressClicks(DOUBLE_CLICK_MS); closeInventory(); },   // Done button
     onHotbarChange(ids, selected) {
       player.hotbar = ids.slice(0, 9);
       if (Number.isInteger(selected)) player.selected = clamp(selected, 0, 8);
@@ -267,8 +339,13 @@ function boot() {
   applyAudioSettings();
 
   input.onLockChange = (locked) => {
+    // A lock granted late (after a retry) while a menu is up would hide the cursor over it.
+    if (locked && (state !== 'playing' || ui.menuOpen)) { document.exitPointerLock(); return; }
     if (!locked && state === 'playing' && !ignoreUnlock) pause();
   };
+  // Without pointer lock nothing else notices the player leaving (e.g. clicking the page around
+  // an embedded game): pause, so the keys they type elsewhere don't matter and Resume takes them back.
+  addEventListener('blur', () => { if (state === 'playing' && !input.locked && !TEST) pause(); });
 
   player.onBreak = (x, y, z, id) => {
     particles.spawnBlockBreak(x, y, z, id);
@@ -285,7 +362,7 @@ function boot() {
   ui.setHotbar(player.hotbar, player.selected);
   renderer.applySettings({ ...settings, renderScale: dynScale });
 
-  addEventListener('resize', () => renderer.resize());
+  addEventListener('resize', () => { renderer.resize(); redraw = true; });
   addEventListener('pagehide', saveGame);
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveGame(); });
 
@@ -302,12 +379,50 @@ function boot() {
     if (input.pressed('F3')) debug = !debug;
   }
 
+  // Adaptive resolution from the rAF interval, the only portable cost signal. It is capped by
+  // vsync, and not always at 60 Hz (battery savers, some displays and remote sessions cap rAF at
+  // 30 Hz with the GPU half idle), so every step down is a probe: when the faster recent frames
+  // (a low percentile of the interval, immune to streaming hitches) don't get faster within 2 s,
+  // resolution wasn't the bottleneck; the step is undone and probing backs off.
+  const recentMs = new Float32Array(32);
+  const fastestRecent = () => {
+    const v = Array.from(recentMs).filter((x) => x > 0).sort((a, b) => a - b);
+    return v.length ? v[Math.floor(v.length / 4)] : Infinity;
+  };
   function adaptResolution(dt) {
-    if (!settings.autoResolution || state === 'title') return;
-    // rAF is vsync-capped, so ~16.7 ms means "keeping up"; step down quickly, recover slowly.
+    recentMs[frameIndex % recentMs.length] = dt * 1000;
+    if (!settings.autoResolution || state === 'paused') return;
+    if (state === 'title' && world.loadedFraction(2) < 1) return;   // streaming spikes
+    if (probe) {
+      probe.t += dt;
+      if (probe.t < 2) return;
+      if (fastestRecent() > probe.ms * 0.9) {
+        if (probe.steps < 2 && dynScale > 0.5 + 1e-3) {
+          // Intervals come in whole vsync periods: one step may not cross one. Try a second.
+          probe.steps++;
+          probe.t = 0;
+          dynScale = Math.max(0.5, dynScale - 0.1);
+          renderer.applySettings({ ...settings, renderScale: dynScale });
+          return;
+        }
+        dynScale = probe.from;
+        renderer.applySettings({ ...settings, renderScale: dynScale });
+        holdoff = Math.min(300, holdoff * 2 || 30);
+        holdUntil = time + holdoff;
+      }
+      probe = null;
+      slowTime = fastTime = 0;
+      return;
+    }
+    if (time < holdUntil) return;
+    // ~16.7 ms means "keeping up" at 60 Hz; step down quickly, recover slowly.
     if (frameMs > 22) { slowTime += dt; fastTime = 0; } else if (frameMs < 18) { fastTime += dt; slowTime = 0; } else { slowTime = fastTime = 0; }
     let next = dynScale;
-    if (slowTime > 1.0) { next = Math.max(0.5, dynScale - 0.1); slowTime = 0; }
+    if (slowTime > 1.0 && dynScale > 0.5 + 1e-3) {
+      next = Math.max(0.5, dynScale - 0.1);
+      probe = { from: dynScale, ms: fastestRecent(), t: 0, steps: 1 };
+      slowTime = 0;
+    }
     if (fastTime > 4.0) { next = Math.min(settings.renderScale, dynScale + 0.05); fastTime = 0; }
     if (Math.abs(next - dynScale) > 1e-3) {
       dynScale = next;
@@ -329,10 +444,7 @@ function boot() {
     const allowInput = state === 'playing' && !ui.menuOpen;
     let camPos, yaw, pitch, fovScale = 1, bob = { x: 0, y: 0 };
     if (state === 'title') {
-      updateTitleCamera(time);
-      camPos = titleCam.pos;
-      yaw = titleCam.yaw;
-      pitch = titleCam.pitch;
+      ({ pos: camPos, yaw, pitch } = titleCameraAt(time - titleT0));
     } else {
       if (state === 'playing') player.update(dt, settings, allowInput);
       const eye = player.eye();
@@ -341,9 +453,13 @@ function boot() {
       camPos = [eye[0] + rx * bob.x, eye[1] + bob.y, eye[2] + rz * bob.x];
       yaw = player.yaw;
       pitch = player.pitch;
-      fovScale = player.fovScale();
+      // Reduced motion: no sprint / flight FOV kick (the underwater narrowing stays).
+      fovScale = REDUCED_MOTION ? (player.eyeInWater ? 0.94 : 1) : player.fovScale();
     }
 
+    lastCam.pos = camPos;
+    lastCam.yaw = yaw;
+    lastCam.pitch = pitch;
     const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
     world.update(camPos[0], camPos[2], settings.renderDistance, fx, fz);
 
@@ -359,7 +475,13 @@ function boot() {
     particles.update(dt, world);
 
     const playingView = state !== 'title' && !hudHidden;
-    renderer.render({
+    // Paused, the view hardly changes under the menu's blur: draw ~10 times a second (and right
+    // after a setting or the window size changed) instead of keeping the GPU at full load.
+    const idle = state === 'paused' && !redraw && time - lastDraw < 0.1;
+    if ((!skipRender && !idle) || captureWaiters.length) {
+      lastDraw = time;
+      redraw = false;
+      renderer.render({
       camPos, yaw, pitch,
       fov: (settings.fov * Math.PI / 180) * fovScale,
       time, dt, timeOfDay, sunDir, moonDir,
@@ -375,7 +497,8 @@ function boot() {
         light: [eyeSkyLight, blockLight],
       } : null,
       cloudCoverage: settings.cloudCoverage,
-    });
+      });
+    }
 
     if (captureWaiters.length) {
       // Read the canvas in the same task as the draw (no preserveDrawingBuffer needed).
@@ -434,6 +557,9 @@ function boot() {
     player, world, renderer, ui, gen, particles,
     get settings() { return settings; },
     get state() { return state; },
+    get renderScale() { return dynScale; },
+    get adaptive() { return { probe: probe && { ...probe }, holdUntil, time, fastest: fastestRecent(), frameMs }; },
+    get camera() { return { pos: lastCam.pos.slice(), yaw: lastCam.yaw, pitch: lastCam.pitch }; },
     get timeOfDay() { return timeOfDay; },
     get frame() { return frameIndex; },
     setTime(t) { timeOfDay = ((t % 1) + 1) % 1; },
@@ -452,9 +578,15 @@ function boot() {
       ui.setSettings(settings);
       renderer.applySettings({ ...settings, renderScale: patch.renderScale ?? dynScale });
       if (patch.renderScale) dynScale = patch.renderScale;
+      probe = null;
+      holdUntil = holdoff = 0;
+      recentMs.fill(0);
+      redraw = true;
     },
     loaded: (r = 3) => world.loadedFraction(r),
     capture: () => new Promise((resolve) => captureWaiters.push(resolve)),
+    setRender(on) { skipRender = !on; },
+    titleCameraAt,
   };
 
   requestAnimationFrame(frame);

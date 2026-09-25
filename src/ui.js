@@ -220,6 +220,14 @@ export class UI {
       setTimeout(() => boot.remove(), reducedMotion() ? 0 : 700);
     }
 
+    // A panel that just replaced another sits under the pointer: the second click of a double
+    // click (or a double tap) must not press whatever is there now (e.g. "Delete world" appears
+    // where "New world" was).
+    this._shownAt = -1e9;
+    root.addEventListener('click', (e) => {
+      if (e.detail > 1 && performance.now() - this._shownAt < 600) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+
     this._onKey = (e) => this._handleKey(e);
     this._onResize = () => this._hideTooltip();
     document.addEventListener('keydown', this._onKey);
@@ -283,6 +291,7 @@ export class UI {
     const next = open === undefined ? !this._invOpen : !!open;
     if (next === this._invOpen) return next;
     this._invOpen = next;
+    if (next) this._shownAt = performance.now();
     if (next) {
       this._fillInventoryIcons();
       this._renderInvMarks();
@@ -384,6 +393,7 @@ export class UI {
   _isSub() { return this.screen === 'settings' || this.screen === 'controls'; }
 
   _setScreen(name) {
+    if (name !== this.screen) this._shownAt = performance.now();
     this.screen = name;
     for (const s of ['title', 'pause', 'settings', 'controls']) this._setOpen(this.el[s], s === name);
     this._syncRootState();
@@ -505,7 +515,7 @@ export class UI {
       dl.append(h('dt', null, label), dd);
     }
     el.debug = h('div', { class: 'debug-panel', hidden: true, 'aria-label': 'Debug information' },
-      h('div', { class: 'debug-head' }, `Blockvale ${this.opts.version || VERSION}`, h('span', null, 'F3')), dl);
+      h('div', { class: 'debug-head' }, `Stereo Sandbox ${this.opts.version || VERSION}`, h('span', null, 'F3')), dl);
 
     el.hudSlots = [];
     const bar = h('div', { class: 'hotbar' });
@@ -551,14 +561,15 @@ export class UI {
       h('div', { class: 'title-main' },
         h('header', { class: 'brand' },
           el.logoMark,
-          h('h1', { class: 'logo' }, 'Blockvale'),
-          h('p', { class: 'tagline' }, 'A voxel sandbox')),
+          h('h1', { class: 'logo' },
+            h('span', { class: 'logo-word' }, 'Stereo'), ' ', h('span', { class: 'logo-word' }, 'Sandbox')),
+          h('p', { class: 'tagline' }, 'A voxel world to build in')),
         h('div', { class: 'title-menu' },
           h('div', { class: 'play-wrap' }, el.play, el.progress),
           h('div', { class: 'menu-row' }, settings, controls),
           el.status,
           h('p', { class: 'touch-note' },
-            'Blockvale is played with a keyboard and mouse. On this device you can enjoy the view.'))),
+            'Stereo Sandbox is played with a keyboard and mouse. On this device you can enjoy the view.'))),
       h('footer', { class: 'title-footer' },
         h('span', null, `Version ${this.opts.version || VERSION}${seed}`),
         h('span', { class: 'title-legal' }, 'Not affiliated with Mojang or Microsoft')));
@@ -577,7 +588,11 @@ export class UI {
       el.resume, h('div', { class: 'menu-row' }, settings, controls), quit, el.newWorld);
 
     el.confirmCancel = this._btn('Keep playing', () => { this._confirm(false); this._focus(el.newWorld); });
-    const del = this._btn('Delete world', () => { if (this.opts.onNewWorld) this.opts.onNewWorld(); }, 'btn-danger');
+    const del = this._btn('Delete world', () => {
+      // Never the same gesture that opened the question (a double click, a bounced key).
+      if (performance.now() - this._shownAt < 600) return;
+      if (this.opts.onNewWorld) this.opts.onNewWorld();
+    }, 'btn-danger');
     el.confirmBox = h('div', { class: 'confirm', role: 'group', 'aria-labelledby': 'confirm-title', hidden: true },
       h('p', { class: 'confirm-title', id: 'confirm-title' }, 'Start a new world?'),
       h('p', { class: 'confirm-text' },
@@ -593,6 +608,7 @@ export class UI {
   }
 
   _confirm(on) {
+    if (on && !this._confirming) this._shownAt = performance.now();
     this._confirming = on;
     if (!this.el.confirmBox) return;
     this.el.confirmBox.hidden = !on;
@@ -931,7 +947,7 @@ export class UI {
         try {
           url = makeBlockIcon(this.textures, id, 64).toDataURL('image/png');
         } catch (e) {
-          console.warn(`Blockvale UI: no icon for ${BLOCKS[id].name}:`, e && e.message);
+          console.warn(`Stereo Sandbox UI: no icon for ${BLOCKS[id].name}:`, e && e.message);
         }
       }
       this._icons.set(id, url);

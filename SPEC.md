@@ -180,6 +180,7 @@ Main → worker
 
 Worker → main
 - `{ type: 'ready' }` after init.
+- `{ type: 'unloaded', keys }` acknowledges an `unload`, so main drops meshes that were already in flight for those chunks.
 - `{ type: 'mesh', cx, cz, blocks: Uint8Array (copy), opaque, water, opaqueQuads, waterQuads, minY, maxY }` — typed arrays transferred.
 
 The worker processes one chunk per task and yields (e.g. `setTimeout(0)` / `MessageChannel`) between
@@ -200,6 +201,7 @@ export class World {
   terminate()
 }
 ```
+If the worker cannot start (load error, or no `ready` within 10 s) World runs the same WorldService on the page instead and calls `onFallback()`.
 World creates the worker (module worker in dev; `new Worker(URL.createObjectURL(new Blob([window.__WORKER_SRC__])))`
 when `window.__WORKER_SRC__` is defined by the single-file build).
 
@@ -409,7 +411,7 @@ export class UI {
 - Adaptive resolution when enabled: keep ~60 fps by nudging renderScale between 0.5 and the setting.
 - Save (localStorage, try/catch): seed, edits, player position/orientation, time of day, hotbar — every
   10 s and on `pagehide`. New world clears it.
-- `window.__game = { player, world, renderer, settings, setTime(t), teleport(x, y, z, yaw, pitch), play() }`.
+- `window.__game = { player, world, renderer, settings, setTime(t), teleport(x, y, z, yaw, pitch), play(), setSettings, capture(), frame, loaded(r), setRender, camera, titleCameraAt, renderScale, adaptive }`.
   URL `?test` → fixed seed 12345, skip saved game, hooks exposed immediately (for headless tests).
 
 ## Build (`build.mjs`)

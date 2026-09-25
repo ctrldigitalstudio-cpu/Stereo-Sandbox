@@ -1,4 +1,4 @@
-/* Blockvale: page shell, menus, HUD and inventory.
+/* Stereo Sandbox: page shell, menus, HUD and inventory.
    Visual language: frosted dark glass over the live world, warm off-white type, a golden-hour
    amber accent, small square-ish corners and crisp pixel details. */
 
@@ -350,16 +350,21 @@ kbd { font: inherit; }
 
 .logo {
   margin: 0;
-  font: 400 96px/0.9 var(--font-display);
+  /* One line, as large as fits: "Stereo Sandbox" is ~9.5em wide in the pixel face. */
+  font: 400 min(92px, calc((100vw - 2 * var(--gutter) - 16px) / 9.6))/0.9 var(--font-display);
   letter-spacing: -0.05em;
   padding-left: 0.05em;
   color: #fff4df;
+  filter: drop-shadow(0 5px 0 rgba(58, 30, 4, 0.55)) drop-shadow(0 0 30px rgba(242, 170, 80, 0.42));
+  white-space: nowrap;
+}
+/* The golden-hour gradient per word, so it reads the same when the words stack on phones. */
+.logo-word {
+  display: inline-block;
   background: linear-gradient(#fff9ee 0%, #ffe2ae 48%, #f2b45a 52%, #f6c77c 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 5px 0 rgba(58, 30, 4, 0.55)) drop-shadow(0 0 30px rgba(242, 170, 80, 0.42));
-  white-space: nowrap;
 }
 
 .tagline {
@@ -822,6 +827,12 @@ kbd { font: inherit; }
   max-width: 100%;
   padding: var(--pad) var(--pad) 14px;
   gap: 12px;
+  /* Very short windows can't fit six rows plus the hotbar even at the smallest slot size:
+     scroll the panel so the hotbar and Done stay reachable. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 .inv-head {
@@ -1218,10 +1229,6 @@ kbd { font: inherit; }
 
 /* ---------- responsive ---------- */
 
-@media (max-width: 900px) {
-  .logo { font-size: 72px; }
-}
-
 @media (max-width: 720px) {
   :root {
     --inv-gap: 3px;
@@ -1237,7 +1244,9 @@ kbd { font: inherit; }
     --slot: min(46px, calc((100vw - 2 * var(--gutter) - 24px) / 9));
     --icon: 28px;
   }
-  .logo { font-size: 48px; }
+  /* Narrow (portrait) screens: stack the two words, sized so "Sandbox" (~5.2em) fills the width. */
+  .logo { font-size: min(64px, calc((100vw - 2 * var(--gutter) - 8px) / 5.3)); line-height: 0.92; }
+  .logo-word { display: block; }
   .logo-mark { width: 48px; height: 48px; margin-bottom: 14px; }
   .tagline { font-size: 12px; letter-spacing: 0.26em; text-indent: 0.26em; }
   .title-legal { display: none; }
@@ -1266,18 +1275,42 @@ kbd { font: inherit; }
 }
 
 @media (max-height: 600px) {
-  :root { --gutter: 10px; --inv-chrome: 132px; }
+  /* --inv-chrome: everything in the inventory panel except the 7 rows of slots (measured). */
+  :root { --gutter: 10px; --inv-chrome: 172px; }
   .inventory-panel { --pad: 12px; gap: 8px; padding-bottom: 12px; }
   .inv-divider { padding-top: 6px; }
+  .inv-head { gap: 10px; }
+  .inv-head .panel-title { font-size: 18px; }
   .inv-hint { display: none; }
   .inv-foot:not(:has(.btn-done)) { display: none; }
   .pause-panel { padding: 18px 18px 14px; gap: 14px; }
+}
+
+@media (max-width: 560px) and (max-height: 600px) {
+  :root { --inv-chrome: 212px; }   /* the search box wraps below the title */
 }
 
 @media (max-height: 560px) {
   .title-main { gap: 20px; }
   .logo-mark { display: none; }
   .settings-panel { height: 100%; }
+}
+
+/* Short narrow windows (small landscape phones, tiny embeds): keep the wordmark on one line. */
+@media (max-width: 560px) and (max-height: 480px) {
+  .logo { font-size: min(92px, calc((100vw - 2 * var(--gutter) - 16px) / 9.6)); line-height: 0.9; }
+  .logo-word { display: inline-block; }
+}
+
+/* Very short windows: compact title so Play and the menu stay on screen. */
+@media (max-height: 300px) {
+  .title-screen { padding-top: 10px; padding-bottom: 8px; }
+  .title-main { gap: 14px; padding: 4px 0; }
+  .logo { font-size: min(92px, calc((100vw - 2 * var(--gutter) - 16px) / 9.6), 24vh); }
+  .tagline { margin-top: 8px; font-size: 11px; }
+  .title-menu { gap: 8px; }
+  .btn-play { min-height: 44px; font-size: 20px; }
+  .title-status, .title-footer { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

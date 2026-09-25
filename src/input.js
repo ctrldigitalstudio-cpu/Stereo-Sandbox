@@ -13,6 +13,7 @@ const LOCK_TIMEOUT_MS = 1500;      // give up waiting for pointerlockchange afte
 const UNLOCK_COOLDOWN_MS = 1250;   // Chrome refuses to re-lock for ~1 s after the user pressed Esc
 const WHEEL_NOTCH = 100;           // pixel-mode wheel delta that counts as one notch
 const WHEEL_DISCRETE = 50;         // a single event this large is a mouse-wheel notch, not a trackpad
+const WHEEL_GAP_MS = 200;          // a pause this long between wheel events starts a new gesture
 
 // Keys whose default action (page scroll, help, find, focus moves) interferes with play. Blocked
 // only while the game owns the mouse, never together with Ctrl/Meta/Alt (browser shortcuts).
@@ -70,6 +71,7 @@ export class Input {
 
     this.locked = false;
     this.dragLook = false;
+    this.lockBlocked = false;          // pointer lock is forbidden here for good (sandbox / policy)
     this.onLockChange = null;
     this.rawInput = true;             // ask for unadjustedMovement (no OS acceleration) when possible
 
@@ -79,6 +81,11 @@ export class Input {
     this._lastMove = 0;
     this._lockPending = null;
     this._lockWaiter = null;
+    this._lockCancel = null;
+    this._ignoreClicksUntil = 0;
+    this._touchTime = -1e9;           // last touch pointerdown (its compatibility mouse events are ignored)
+    this._spike = null;               // last dropped locked-mouse delta
+    this._wheelDir = 0;
 
     this._listeners = [];
     const on = (target, type, fn, opts) => {
@@ -95,6 +102,7 @@ export class Input {
     on(this.doc, 'pointerlockchange', this._onLockChange);
     on(this.doc, 'pointerlockerror', this._onLockError);
     on(this.doc, 'visibilitychange', this._onVisibility);
+    on(this.element, 'pointerdown', this._onPointerDown);
     on(this.element, 'mousedown', this._onMouseDown);
     on(this.element, 'contextmenu', this._onContextMenu);
     on(this.element, 'wheel', this._onWheel, { passive: false });
@@ -125,6 +133,12 @@ export class Input {
     this.wheelSteps = 0;
   }
 
+  // Ignore presses on the element for a moment (e.g. the rest of a double click that started on a
+  // menu button which has just disappeared).
+  suppressClicks(ms) {
+    this._ignoreClicksUntil = this.now() + ms;
+  }
+
   releaseAll() {
     this.keys.clear();
     this.buttons[0] = this.buttons[1] = this.buttons[2] = false;
@@ -147,7 +161,7 @@ export class Input {
     if (this._lockPending) return this._lockPending;
     const el = this.element, doc = this.doc;
     this._blurFocused();
-    if (!el || !doc || typeof el.requestPointerLock !== 'function') {
+    if (!el || !doc || typeof el.requestPointerLock !== 'function' || this.lockBlocked) {
       this.dragLook = true;
       return Promise.resolve(false);
     }
@@ -155,15 +169,17 @@ export class Input {
     this._lockPending = new Promise((resolve) => {
       let settled = false, retried = false, attemptId = 0, timer = 0;
       const clear = () => { if (timer) clearTimeout(timer); timer = 0; };
-      const settle = (ok) => {
+      const settle = (ok, fallback = true) => {
         if (settled) return;
         settled = true;
         clear();
         this._lockWaiter = null;
         this._lockPending = null;
-        if (!ok) this.dragLook = true;
+        this._lockCancel = null;
+        if (!ok && fallback) this.dragLook = true;
         resolve(ok);
       };
+      this._lockCancel = () => settle(false, false);
       const isLocked = () => doc.pointerLockElement === el;
       const failed = () => {
         // Denied right after the user left pointer lock with Esc: Chrome's re-lock cooldown.
@@ -183,6 +199,13 @@ export class Input {
         let usesPromise = false;
         const onFail = (err) => {
           if (settled || id !== attemptId) return;
+          if (err && err.name === 'SecurityError' && /sandbox|policy/i.test(err.message || '')) {
+            // A sandboxed frame without allow-pointer-lock (or a permissions policy): this won't
+            // change during the session, so stop asking (each attempt logs a console error).
+            this.lockBlocked = true;
+            settle(false);
+            return;
+          }
           if (raw && (!err || err.name === 'NotSupportedError' || err.name === 'TypeError')) {
             // unadjustedMovement isn't available on this platform: plain lock instead.
             this.rawInput = false;
@@ -219,6 +242,12 @@ export class Input {
       attempt(this.rawInput);
     });
     return this._lockPending;
+  }
+
+  // Abandon a pending lock request (and its delayed retry) without switching to drag-look: the
+  // game went to a menu meanwhile. A grant that still arrives is undone by the caller.
+  cancelLock() {
+    if (this._lockCancel) this._lockCancel();
   }
 
   _onLockChange() {
@@ -286,9 +315,25 @@ export class Input {
 
   // ---- mouse ---------------------------------------------------------------------------------
 
+  _onPointerDown(e) {
+    if (e.pointerType === 'touch') this._touchTime = this.now();
+  }
+
   _onMouseDown(e) {
     const b = e.button;
     if (!(b >= 0 && b <= 2)) return;
+    // preventDefault below also stops the click from focusing this document: inside an iframe
+    // whose host page has focus the keys would never reach the game again. Take focus explicitly.
+    const doc = this.doc, win = this.win;
+    if (doc && win && typeof doc.hasFocus === 'function' && !doc.hasFocus() && typeof win.focus === 'function') win.focus();
+    // Ignored: the tail of a double click that opened the game, a mouse event synthesized from a
+    // touch (a tap would break a block; there are no touch controls), or a click while pointer
+    // capture is still being set up (it is neither a locked click nor a drag-look gesture yet).
+    if (this.now() < this._ignoreClicksUntil || this.now() - this._touchTime < 800 ||
+        (this._lockPending && !this.locked && !this.dragLook)) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      return;
+    }
     // No middle-click autoscroll, no text selection while drag-looking.
     if ((b === 1 || this.locked || this.dragLook) && typeof e.preventDefault === 'function') e.preventDefault();
     this._blurFocused();
@@ -332,8 +377,16 @@ export class Input {
       const dx = e.movementX || 0, dy = e.movementY || 0;
       if (this._skipMoves > 0) { this._skipMoves--; return; }
       // Some browser/OS combinations report a single huge bogus delta; real flicks ramp up.
+      // A sudden huge delta is dropped, unless the one before it was dropped too and pointed the
+      // same way: that is a genuine fast flick (only its first frame is lost), while a bogus
+      // jump and its jump back cancel out.
       const m = Math.abs(dx) + Math.abs(dy);
-      if (m > 250 && m > 6 * (this._lastMove + 25)) return;
+      const s = this._spike;
+      if (m > 250 && m > 6 * (this._lastMove + 25) && !(s && dx * s[0] + dy * s[1] > 0)) {
+        this._spike = [dx, dy];
+        return;
+      }
+      this._spike = null;
       this._lastMove = m;
       this.dx += dx;
       this.dy += dy;
@@ -341,6 +394,13 @@ export class Input {
     }
     const g = this._gesture;
     if (!g) return;
+    if (e.buttons === 0) {
+      // The button came up where we never saw it (outside an embedding frame, over a context menu
+      // or another window): end the drag / hold instead of turning or digging forever.
+      this._gesture = null;
+      if (g.holding) this.buttons[g.button] = false;
+      return;
+    }
     const x = e.clientX || 0, y = e.clientY || 0;
     if (!g.dragging) {
       if (Math.hypot(x - g.x0, y - g.y0) <= DRAG_THRESHOLD) return;
@@ -363,14 +423,25 @@ export class Input {
     if (!d) d = e.deltaX || 0;         // Shift+wheel arrives as horizontal on some systems
     if (!d) return;
     const now = this.now();
-    if (now - this.wheelTime > 300 || Math.sign(d) !== Math.sign(this.wheelAcc)) this.wheelAcc = 0;
+    // A new gesture: nothing for a while, or the direction changed.
+    const fresh = now - this.wheelTime > WHEEL_GAP_MS || Math.sign(d) !== this._wheelDir;
     this.wheelTime = now;
+    this._wheelDir = Math.sign(d);
+    if (fresh) this.wheelAcc = 0;
     if (e.deltaMode === 2) { this.wheelSteps += Math.sign(d); return; }     // pages
     if (e.deltaMode === 1) d *= WHEEL_NOTCH / 3;                            // lines (3 per notch)
     if (Math.abs(d) >= WHEEL_DISCRETE) {
       // A wheel notch (or a few coalesced ones): one slot each, however large the OS makes it.
       this.wheelSteps += Math.sign(d) * Math.max(1, Math.round(Math.abs(d) / WHEEL_NOTCH));
       this.wheelAcc = 0;
+      return;
+    }
+    if (fresh) {
+      // The first event of a gesture is always one slot, however small: macOS reports a slow
+      // wheel notch as ~4 px. It is paid for out of the rest of the gesture, so a trackpad swipe
+      // still moves one slot per WHEEL_DISCRETE px in total.
+      this.wheelSteps += Math.sign(d);
+      this.wheelAcc = d - Math.sign(d) * WHEEL_DISCRETE;
       return;
     }
     // Trackpads and high-resolution wheels: many small deltas add up to steps.
