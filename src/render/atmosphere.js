@@ -1,10 +1,12 @@
 // Physically based sky: the sky-view LUT (single scattering: Rayleigh + Mie + ozone, sun plus a
-// faint moon-lit sky), the 4x1 irradiance texture every shader lights with, the sky pass (sun disk,
-// moon with phases, stars) and the shared noise textures. Also derives the per-frame celestial
-// state (which light casts shadows, visibilities, moon phase, star rotation, fog density).
+// faint moon-lit sky), the irradiance texture every shader lights with (8 lighting texels + the
+// renderer's far-terrain edge map), the sky pass (sun disk, moon with phases, stars, and the
+// world past the loaded area below the horizon) and the shared noise textures. Also derives the
+// per-frame celestial state (which light casts shadows, visibilities, moon phase, star rotation,
+// fog density).
 
 import { Program, createTexture2D, createFramebuffer, drawFullscreen } from '../gl.js';
-import { GLSL_COMMON, FULLSCREEN_VS, FULLSCREEN_FAR_VS, SKY_LUT_W, SKY_LUT_H } from './common.js';
+import { GLSL_COMMON, FULLSCREEN_VS, FULLSCREEN_FAR_VS, SKY_LUT_W, SKY_LUT_H, IRRADIANCE_TEXELS, EDGE_BINS } from './common.js';
 import { mulberry32 } from '../noise.js';
 import { smoothstep } from '../math.js';
 
@@ -28,8 +30,10 @@ const ATMOSPHERE_GLSL = `
 const float R_GROUND = 6360.0;
 const float R_TOP = 6460.0;
 const vec3 BETA_R = vec3(5.802e-3, 13.558e-3, 33.1e-3);
-const float BETA_MS = 3.996e-3;
-const float BETA_ME = 4.4e-3;
+// Aerosol (Mie) at about half the standard clear-sky amount: a deeper blue sky and a horizon
+// that isn't several times brighter than sunlit ground (a milky glare the terrain fog fades into).
+const float BETA_MS = 2.0e-3;
+const float BETA_ME = 2.2e-3;
 const vec3 BETA_O = vec3(0.650e-3, 1.881e-3, 0.085e-3);
 const float SUN_ANGULAR_RADIUS = 0.0093;
 
@@ -113,24 +117,22 @@ vec3 scatter(vec3 ro, vec3 rd) {
     vec3 ts = lightTransmittance(p, S);
     sun += tv * ts * (sR * pRs + sM * pMs) * ds;
     // Isotropic proxy for higher scattering orders: lifts and softens the horizon and twilight.
-    ms += tv * ts * (sR + sM) * ds;
+    // (Aerosol light is mostly forward-scattered, so it adds little here: a milky, sun-coloured
+    // horizon all around the sky would read as fog at sunset.)
+    ms += tv * ts * (sR + sM * 0.3) * ds;
     if (moon) mo += tv * lightTransmittance(p, M) * (sR * pRm + sM * pMm) * ds;
   }
   return uSunI * (sun + ms * (0.25 / (4.0 * PI))) + uMoonI * mo;
 }
 
 void main() {
-  vec3 rd = skyLutDir(vUV);
-  float below = max(-rd.y, 0.0);
-  vec3 d = rd;
-  // Below the horizon the LUT continues the colour applyFog() fades distant terrain into (the sky at
-  // elevation +0.02), so the void past the render distance matches fogged terrain; it only darkens
-  // toward a dim ground when looking steeply down.
-  if (d.y < 0.02) { d.y = 0.02; d = normalize(d); }
+  vec3 d = skyLutDir(vUV);
+  // Below the horizon the LUT holds the horizon colour at that azimuth (what an infinitely long,
+  // hazy ray converges to); voidColor() in common.js builds the below-horizon view from it.
+  if (d.y < 0.0) { d.y = 0.0; d = normalize(d); }
   vec3 c = scatter(vec3(0.0, R_GROUND + uAlt, 0.0), d);
   // Airglow floor, a little brighter toward the horizon (longer path through the glowing layer).
   c += uNight * (0.75 + 0.6 * exp(-d.y * 6.0));
-  if (below > 0.0) c *= mix(1.0, 0.4, smoothstep(0.25, 1.0, below));
   o = vec4(c, 1.0);
 }
 `;
@@ -160,7 +162,22 @@ void main() {
   sky /= 64.0;
   if (i == 0) { o = vec4(sky, 1.0); return; }
   // Ground bounce: albedo ~0.2 lit by the sky and the direct light (part of the ground is shadowed).
-  o = vec4(vec3(0.21, 0.2, 0.17) * (light * (max(uLightDir.y, 0.0) * 0.8) + sky), 1.0);
+  vec3 ground = vec3(0.21, 0.2, 0.17) * (light * (max(uLightDir.y, 0.0) * 0.8) + sky);
+  if (i == 1) { o = vec4(ground, 1.0); return; }
+  // 4..7: vertical faces toward +X, -X, +Z, -Z (an "ambient cube"): the upper half of their
+  // hemisphere sees that side of the sky (warm toward a low sun, cool away from it), the lower
+  // half the ground bounce.
+  vec3 axis = i == 4 ? vec3(1.0, 0.0, 0.0) : i == 5 ? vec3(-1.0, 0.0, 0.0) : i == 6 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 0.0, -1.0);
+  vec3 tb = abs(axis.x) > 0.5 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 side = vec3(0.0);
+  for (int k = 0; k < 64; k++) {
+    float u = (float(k) + 0.5) / 64.0;
+    float r = sqrt(u);
+    float a = float(k) * 2.39996323;
+    vec3 d = axis * sqrt(1.0 - u) + vec3(0.0, 1.0, 0.0) * (r * abs(cos(a))) + tb * (r * sin(a));
+    side += texture(uSkyLUT, skyLutUV(d)).rgb;
+  }
+  o = vec4(side / 64.0 * 0.5 + ground * 0.5, 1.0);
 }
 `;
 
@@ -189,7 +206,7 @@ vec3 hash33(vec3 p) {
   return fract((p.xxy + p.yxx) * p.zyx);
 }
 
-vec3 stars(vec3 dir, float pixAngle) {
+vec3 stars(vec3 dir, float pixAngle, float skyLum) {
   // Star-fixed frame: undo the daily rotation about the celestial pole (normal of the sun's orbit).
   vec3 axis = vec3(0.0, -sin(TILT), cos(TILT));
   vec3 sd = rotateAxis(dir, axis, -uWind.z);
@@ -209,18 +226,22 @@ vec3 stars(vec3 dir, float pixAngle) {
   float mag = pow(fract(h * 37.3 + r.z * 3.1), 5.0) * 0.9 + 0.06;
   float twinkle = 0.7 + 0.3 * sin(uCamPos.w * (2.0 + 4.0 * r.x) + h * 91.0);
   vec3 tint = mix(vec3(0.72, 0.82, 1.0), vec3(1.0, 0.86, 0.7), r.y);
-  return tint * core * mag * twinkle * 0.3;
+  // A star shows once it outshines the sky around it: in twilight only the brightest do.
+  float vis = smoothstep(0.6, 2.0, mag * 0.3 / max(skyLum * 12.0, 1e-5));
+  return tint * core * mag * twinkle * 0.3 * vis;
 }
 
 void main() {
   vec3 dir = normalize(positionFromDepth(vUV, 1.0));
-  vec3 col = sampleSky(dir);
-  float horizon = smoothstep(-0.012, 0.012, dir.y);
+  vec3 col = voidColor(dir);
+  // Sun, moon and stars sink into the horizon haze.
+  float horizon = smoothstep(-0.012, 0.012, dir.y) * skyHazeT(dir.y);
   float pixAngle = 2.0 / (uProj[1][1] * uRes.y);
 
-  // Stars fade in as the sky darkens and are dimmed by extinction near the horizon.
-  float starVis = (1.0 - smoothstep(0.006, 0.04, luminance(col))) * smoothstep(0.0, 0.25, dir.y);
-  vec3 starCol = starVis > 0.0 ? stars(dir, pixAngle) * starVis : vec3(0.0);
+  // Stars appear as the sky darkens (brightest first) and are dimmed by extinction near the horizon.
+  float skyLum = luminance(col);
+  float starVis = smoothstep(0.0, 0.25, dir.y);
+  vec3 starCol = starVis > 0.0 && skyLum < 0.03 ? stars(dir, pixAngle, skyLum) * starVis : vec3(0.0);
 
   // Moon: a lit sphere with maria and craters; the terminator follows the phase angle.
   vec3 M = uMoonDir.xyz;
@@ -514,7 +535,9 @@ export class Atmosphere {
     this.skyLUT = createTexture2D(gl, SKY_LUT_W, SKY_LUT_H, { ...hdrFormat, filter: gl.LINEAR });
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); // azimuth wraps around
     this.lutFB = createFramebuffer(gl, [this.skyLUT]);
-    this.irradiance = createTexture2D(gl, 4, 1, { ...hdrFormat, filter: gl.NEAREST });
+    // Lighting texels (rendered here) + the far-terrain edge map (uploaded by the renderer).
+    this.irradiance = createTexture2D(gl, IRRADIANCE_TEXELS + 2 * EDGE_BINS, 1, { ...hdrFormat, filter: gl.NEAREST });
+    this.hdrFormat = hdrFormat;
     this.irrFB = createFramebuffer(gl, [this.irradiance]);
     this.noise2D = createNoise2DTexture(gl);
     this.noise3D = createNoise3DTexture(gl);
@@ -567,7 +590,7 @@ export class Atmosphere {
     // Fog: a little denser at dawn/dusk (morning haze) and at night.
     const dawnDusk = Math.exp(-((sun[1] / 0.2) ** 2));
     const night = smoothstep(0.05, -0.25, sun[1]);
-    const fogDensity = 1.0 + 0.45 * dawnDusk + 0.3 * night;
+    const fogDensity = 1.0 + 0.3 * dawnDusk + 0.3 * night;
 
     this.state = {
       timeOfDay: t,
@@ -623,7 +646,7 @@ export class Atmosphere {
     drawFullscreen(gl);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.irrFB);
-    gl.viewport(0, 0, 4, 1);
+    gl.viewport(0, 0, IRRADIANCE_TEXELS, 1);
     const q = this.irrProgram.use();
     gl.uniform1f(q.u('uAlt'), alt);
     gl.uniform3f(q.u('uSunLight'), SUN_LIGHT[0], SUN_LIGHT[1], SUN_LIGHT[2]);

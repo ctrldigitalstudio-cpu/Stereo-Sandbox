@@ -11,6 +11,10 @@ export const CLOUD_BOTTOM = 190;
 export const CLOUD_TOP = 250;
 export const SKY_LUT_W = 256;
 export const SKY_LUT_H = 128;
+// uIrradiance layout: IRRADIANCE_TEXELS lighting texels rendered by the atmosphere, then
+// 2 x EDGE_BINS texels of far-terrain summary per azimuth uploaded by the renderer.
+export const IRRADIANCE_TEXELS = 8;
+export const EDGE_BINS = 64;
 
 // ---------------------------------------------------------------------------------------------
 // Frame uniform block (std140, binding point 0). Offsets are in floats.
@@ -115,7 +119,7 @@ uniform sampler2DArray uSpecular;  // unit 2: r = smoothness, g = metalness, b =
 uniform sampler2DShadow uShadowCmp;// unit 3: shadow depth (hardware compare, linear)
 uniform sampler2D uShadowRaw;      // unit 4: shadow depth (raw, nearest)
 uniform sampler2D uSkyLUT;         // unit 5: sky radiance by direction (see skyLutUV)
-uniform sampler2D uIrradiance;     // unit 6: 4x1 lighting texels (see helpers below)
+uniform sampler2D uIrradiance;     // unit 6: (8 + 2 x EDGE_BINS) x 1: lighting texels + edge map (see helpers below)
 uniform sampler2D uNoise2D;        // unit 7: 256^2 tileable noise, rgba = fbm (4, 8, 16 cells), worley
 uniform sampler3D uNoise3D;        // unit 8: 64^3 tileable cloud detail noise (r)
 `;
@@ -127,6 +131,8 @@ const float SHADOW_DISTORT = ${SHADOW_DISTORT};
 const float SHADOW_DEPTH_RANGE = ${SHADOW_DEPTH_RANGE.toFixed(1)};
 const float CLOUD_BOTTOM = ${CLOUD_BOTTOM.toFixed(1)};
 const float CLOUD_TOP = ${CLOUD_TOP.toFixed(1)};
+const int IRRADIANCE_TEXELS = ${IRRADIANCE_TEXELS};
+const int EDGE_BINS = ${EDGE_BINS};
 
 float saturate(float x) { return clamp(x, 0.0, 1.0); }
 vec3 saturate(vec3 x) { return clamp(x, 0.0, 1.0); }
@@ -196,17 +202,23 @@ vec3 skyLutDir(vec2 uv) {
   float el = sign(t) * t * t * 0.5 * PI;
   return vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
 }
-vec3 sampleSky(vec3 d) { return texture(uSkyLUT, skyLutUV(normalize(d))).rgb; }
+vec3 sampleSky(vec3 d) { return textureLod(uSkyLUT, skyLutUV(normalize(d)), 0.0).rgb; } // single level: safe in branches
 
 vec3 skyIrradiance()    { return texelFetch(uIrradiance, ivec2(0, 0), 0).rgb; } // hemisphere above
 vec3 groundIrradiance() { return texelFetch(uIrradiance, ivec2(1, 0), 0).rgb; } // bounce from below
 vec3 lightColor()       { return texelFetch(uIrradiance, ivec2(2, 0), 0).rgb; } // sun or moon illuminance at the ground
 vec3 sunDiskRadiance()  { return texelFetch(uIrradiance, ivec2(3, 0), 0).rgb; } // radiance of the visible sun disk
+// Texels 4..7: irradiance of vertical faces toward +X, -X, +Z, -Z (sky side + ground bounce).
 
-// Ambient light arriving at a surface with normal n (hemisphere blend)
+// Ambient light arriving at a surface with normal n: an "ambient cube" (squared normal components
+// weight the up/down/side irradiances), so faces toward a low sun get its warm sky and the others
+// the cool sky opposite.
 vec3 ambientLight(vec3 n) {
-  float up = n.y * 0.5 + 0.5;
-  return skyIrradiance() * up + groundIrradiance() * (1.0 - up);
+  vec3 n2 = n * n;
+  vec3 ex = texelFetch(uIrradiance, ivec2(n.x >= 0.0 ? 4 : 5, 0), 0).rgb;
+  vec3 ez = texelFetch(uIrradiance, ivec2(n.z >= 0.0 ? 6 : 7, 0), 0).rgb;
+  vec3 ey = n.y >= 0.0 ? skyIrradiance() : groundIrradiance();
+  return (ex * n2.x + ey * n2.y + ez * n2.z) / max(n2.x + n2.y + n2.z, 1e-4);
 }
 
 float henyeyGreenstein(float cosTheta, float g) {
@@ -229,28 +241,119 @@ float cloudShadow(vec3 worldPos) {
   return 1.0 - 0.72 * cloudCoverage(p);
 }
 
+// ---- Water optics (per block), shared by the terrain (light reaching underwater faces), the
+// underwater view (composite), the water surface seen from below and the underwater light shafts.
+// Red is absorbed within a few blocks, green within ~20, blue carries ~30 blocks.
+const vec3 WATER_EXT = vec3(0.28, 0.042, 0.026);
+// Single-scattering albedo: the colour the water column converges to, per unit of light.
+const vec3 WATER_SCATTER = vec3(0.03, 0.22, 0.5);
+// Light available for in-scattering at the given depth below the surface (sun + sky, attenuated).
+vec3 underwaterLight(float depth) {
+  vec3 E = lightColor() * max(uLightDir.y, 0.0) * 0.55 + skyIrradiance() * 0.6;
+  return E * exp(-WATER_EXT * depth * 1.2);
+}
+
 // ---- Fog / aerial perspective --------------------------------------------------------------
-// Exponential height fog toward the sky colour, plus a hard fade near the render distance so
-// chunk loading is hidden. skyLight (0..1) of the shaded point keeps cave fog dark.
-float heightFogAmount(float dist, float dirY) {
-  float a = 0.0017 * uWind.w;
-  float b = 0.035;
+// Haze is an optical depth along the view ray. Its density is concentrated near the ground
+// (exponential in altitude, averaged analytically along the ray: valleys are hazy, views from a
+// mountain top or straight down are clear) and grows with the horizontal distance relative to the
+// render distance (uCam.z = distance at which the loaded area may end): clear foreground, hazy
+// distance, whatever the render distance. uWind.w thickens it at dawn/dusk and at night.
+// Blue scatters more than red (FOG_SPECTRAL): partly hazed terrain turns blue before it reaches
+// the haze colour, which is the sky just above the horizon at that azimuth (hazeColor), and the
+// lowest degrees of the sky itself are seen through the same haze (hazedSky).
+// Past the loaded area the sky pass draws voidColor(): the world continued as a flat plane of
+// land or sea (per azimuth, from the edge map the renderer builds of the outermost chunks) seen
+// through the same haze. Terrain near the edge dissolves into exactly that colour, so the border
+// of the loaded area is invisible at any render distance.
+const vec3 FOG_SPECTRAL = vec3(0.7, 0.9, 1.3);
+// Mean relative haze density (1 at sea level) along a ray of length dist with direction.y = dirY.
+float hazeDensityAlong(float dist, float dirY) {
+  const float b = 0.022;
   float camH = max(uCamPos.y - SEA_LEVEL, -20.0);
   float k = dirY * b * dist;
   float f = abs(k) > 1e-4 ? (1.0 - exp(-k)) / k : 1.0;
-  return a * exp(-camH * b) * dist * f;
+  return exp(-camH * b) * f;
 }
-vec3 fogColor(vec3 dir, float skyLight) {
-  vec3 c = sampleSky(vec3(dir.x, max(dir.y, 0.0) + 0.02, dir.z));
-  return c * mix(0.03, 1.0, max(uCam.w, skyLight));
+float hazeOD(float dist, float horizDist, float dirY) {
+  // Quadratic up to the loaded-area edge; past it (the far plane of voidColor) it only grows
+  // slowly, so a distant sea or plain stays visible and the true distance fog takes it to the
+  // horizon.
+  float x = horizDist / uCam.z;
+  float shape = x < 1.0 ? x * x : 0.5 + 0.5 * x;
+  return hazeDensityAlong(dist, dirY) * ((0.25 + 0.15 * uWind.w) * shape + 0.0012 * uWind.w * dist);
 }
+// Horizontal direction with the same azimuth (safe for straight up/down).
+vec3 horizonDir(vec3 d) { return normalize(vec3(d.x, 0.0, d.z) + vec3(1e-5, 0.0, 0.0)); }
+// Colour distant terrain fades into: the sky just above the horizon at that azimuth (so the far
+// landscape melts into the sky behind it), a little darker (haze in front of the brighter far
+// horizon), and greyer under cloud cover.
+vec3 hazeColor(vec3 dir) {
+  vec3 h = horizonDir(dir);
+  vec3 c = sampleSky(vec3(h.x, 0.035, h.z)) * 0.82;
+  return mix(c, vec3(luminance(c)) * 0.85, uEnv.z * 0.5);
+}
+vec3 fogColor(vec3 dir, float skyLight) { return hazeColor(dir) * mix(0.03, 1.0, max(uCam.w, skyLight)); }
+// The sky seen through the ground haze layer: thick right at the horizon (where it meets the
+// hazed terrain and the void), gone a few degrees up; thinner from high altitude.
+float skyHazeT(float dirY) {
+  return exp(-0.025 * uWind.w * exp(-max(uCamPos.y - SEA_LEVEL, 0.0) * 0.022) / max(dirY, 1e-3));
+}
+vec3 hazedSky(vec3 dir) { return mix(hazeColor(dir), sampleSky(dir), skyHazeT(dir.y)); }
+
+// Far-terrain summary at the azimuth of dir (texels after the lighting ones, see EDGE_BINS):
+// rgb = mean top albedo of the land near the loaded-area edge, a = ocean fraction; landY = mean
+// land height; returns false while there is no data yet.
+bool edgeSummary(vec3 dir, out vec4 s, out float landY) {
+  float a = atan(dir.z, dir.x) * (float(EDGE_BINS) / (2.0 * PI)) - 0.5;
+  float f = fract(a);
+  int i0 = int(floor(a)) & (EDGE_BINS - 1), i1 = (i0 + 1) & (EDGE_BINS - 1);
+  const int T0 = IRRADIANCE_TEXELS, T1 = IRRADIANCE_TEXELS + EDGE_BINS;
+  s = mix(texelFetch(uIrradiance, ivec2(T0 + i0, 0), 0), texelFetch(uIrradiance, ivec2(T0 + i1, 0), 0), f);
+  vec4 h = mix(texelFetch(uIrradiance, ivec2(T1 + i0, 0), 0), texelFetch(uIrradiance, ivec2(T1 + i1, 0), 0), f);
+  landY = h.r;
+  return h.a > 0.5;
+}
+
+// What the sky pass shows in direction dir: the sky above the horizon; below it the world past
+// the loaded area continued as a flat plane at the height of the terrain near the edge in that
+// direction (land with its mean colour, or sea: sky mirror with Fresnel over deep water), fading
+// into the horizon haze with distance.
+vec3 voidColor(vec3 dir) {
+  if (dir.y >= 0.0) return hazedSky(dir);
+  vec3 horizon = hazeColor(dir);
+  vec4 e;
+  float landY;
+  if (!edgeSummary(dir, e, landY)) { e = vec4(0.0, 0.0, 0.0, 1.0); landY = SEA_LEVEL; }
+  float h = uCamPos.y - mix(landY, SEA_LEVEL + 0.9, e.a);
+  if (h < 0.5) return horizon;
+  float s = -dir.y;
+  float t = h / max(s, 1e-4);
+  vec3 T = exp(-hazeOD(t, t * sqrt(max(1.0 - s * s, 0.0)), dir.y) * FOG_SPECTRAL);
+  vec3 sunE = lightColor() * max(uLightDir.y, 0.0);
+  // Land: lit like rough terrain (part of it in shadow), broken up into large patches (woods,
+  // clearings) so it doesn't read as a flat sea; filtered by the pixel footprint on the plane.
+  vec2 hit = uCamPos.xz + dir.xz * t;
+  float foot = t * (2.0 / (uProj[1][1] * uRes.y)) / max(s, 0.03);
+  vec2 nz = textureLod(uNoise2D, hit / 700.0, log2(max(foot / 1.4, 1.0))).rg;
+  vec3 land = e.rgb * (sunE * 0.6 + skyIrradiance() * 0.8) * mix(0.7, 1.2, nz.g * 0.65 + nz.r * 0.35);
+  float F = 0.02 + 0.8 * pow(1.0 - s, 5.0);
+  vec3 refl = hazedSky(vec3(dir.x, s, dir.z));
+  vec3 sea = mix((skyIrradiance() + sunE * 0.8) * vec3(0.004, 0.022, 0.05), refl, F);
+  return mix(land, sea, e.a) * T + horizon * (1.0 - T);
+}
+
 vec3 applyFog(vec3 color, vec3 posRel, float skyLight) {
   float dist = length(posRel);
   vec3 dir = posRel / max(dist, 1e-4);
-  float fog = 1.0 - exp(-heightFogAmount(dist, dir.y));
-  float edge = smoothstep(uCam.z * 0.72, uCam.z * 0.98, dist);
-  fog = max(fog, edge);
-  return mix(color, fogColor(dir, skyLight), saturate(fog));
+  float hd = length(posRel.xz);
+  vec3 T = exp(-hazeOD(dist, hd, dir.y) * FOG_SPECTRAL);
+  float dark = mix(0.03, 1.0, max(uCam.w, skyLight));
+  vec3 c = color * T + hazeColor(dir) * dark * (1.0 - T);
+  // Border of the loaded area: dissolve into the colour the sky pass draws behind it.
+  float edge = smoothstep(0.84, 1.0, hd / uCam.z);
+  if (edge > 0.0) c = mix(c, voidColor(dir) * dark, edge);
+  return c;
 }
 `;
 

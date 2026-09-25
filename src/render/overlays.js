@@ -392,13 +392,16 @@ export class Overlays {
     const sq = Math.sin(sw * sw * Math.PI);
     const bx = held.bobX || 0, by = held.bobY || 0;
 
+    // Placement follows Minecraft's first-person item: the block sits low in the lower-right
+    // corner, turned 45 degrees so the top and both inner faces show, about a fifth of the
+    // screen wide; plants/torches are held as a flat, slightly tilted sprite.
     let model;
     if (mesh.sprite) {
-      model = mul(translate(0.66 - 0.34 * sr + bx * 0.6, -0.46 + 0.16 * Math.sin(Math.sqrt(sw) * Math.PI * 2) - 0.7 * lower + by * 0.6, -0.95 - 0.18 * Math.sin(sw * Math.PI)),
-        mul(rotY((-12 - 18 * sq) * DEG), mul(rotX((-8 - 45 * sr) * DEG), mul(rotZ((18 - 10 * sr) * DEG), mul(scale(0.66), translate(-0.5, -0.3, -7.5 / 16))))));
+      model = mul(translate(0.7 - 0.34 * sr + bx * 0.6, -0.5 + 0.16 * Math.sin(Math.sqrt(sw) * Math.PI * 2) - 0.7 * lower + by * 0.6, -1.05 - 0.18 * Math.sin(sw * Math.PI)),
+        mul(rotY((-12 - 18 * sq) * DEG), mul(rotX((-8 - 45 * sr) * DEG), mul(rotZ((18 - 10 * sr) * DEG), mul(scale(0.56), translate(-0.5, -0.3, -7.5 / 16))))));
     } else {
-      model = mul(translate(0.7 - 0.4 * sr + bx * 0.6, -0.56 + 0.16 * Math.sin(Math.sqrt(sw) * Math.PI * 2) - 0.7 * lower + by * 0.6, -1.0 - 0.2 * Math.sin(sw * Math.PI)),
-        mul(rotY((45 - 20 * sq) * DEG), mul(rotX((8 - 40 * sr) * DEG), mul(rotZ(-12 * sr * DEG), mul(scale(0.4), translate(-0.5, -0.5, -0.5))))));
+      model = mul(translate(0.8 - 0.4 * sr + bx * 0.6, -0.64 + 0.16 * Math.sin(Math.sqrt(sw) * Math.PI * 2) - 0.7 * lower + by * 0.6, -1.1 - 0.2 * Math.sin(sw * Math.PI)),
+        mul(rotY((45 - 20 * sq) * DEG), mul(rotX((6 - 40 * sr) * DEG), mul(rotZ(-12 * sr * DEG), mul(scale(0.34), translate(-0.5, -0.5, -0.5))))));
     }
 
     let aspect = view.aspect;

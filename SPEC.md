@@ -298,7 +298,8 @@ Time of day: 0 = sunrise, 0.25 = noon, 0.5 = sunset, 0.75 = midnight. Sun direct
 Frame graph (render size = canvas size × renderScale):
 1. `atmosphere.update(frame)`: sky-view LUT `SKY_LUT_W × SKY_LUT_H` RGBA16F (single-scattering Rayleigh + Mie +
    ozone, 16 view steps × 8 light steps, sun plus a faint moon-lit sky, parametrised by `skyLutDir`),
-   irradiance 4×1 RGBA16F (texel meanings in common.js: integrate the LUT over the hemisphere for sky
+   irradiance texture (8 + 2×64 texels: 4 lighting texels incl. directional ambient, plus a 128-texel far-terrain
+   horizon summary; texel meanings in common.js: integrate the LUT over the hemisphere for sky
    irradiance; ground bounce ≈ albedo 0.25 × (sun + sky); light colour = transmittance to the sun × intensity,
    or moonlight (0.25, 0.32, 0.45)×0.12 at night; sun disk radiance). Night sky must stay deep blue, not black.
 2. Shadow pass (if enabled) into a `shadowRes²` DEPTH_COMPONENT24 texture: `terrain.drawShadow`.

@@ -4,7 +4,7 @@
 
 import { createGL, createTexture2D, createDepthTexture, createFramebuffer, UNIT } from './gl.js';
 import { mat4, forwardFromYawPitch, frustumPlanes } from './math.js';
-import { FrameUniforms, computeShadowMatrix } from './render/common.js';
+import { FrameUniforms, computeShadowMatrix, IRRADIANCE_TEXELS, EDGE_BINS } from './render/common.js';
 import { TerrainRenderer } from './render/terrain.js';
 import { Overlays } from './render/overlays.js';
 import { Atmosphere } from './render/atmosphere.js';
@@ -60,6 +60,10 @@ export class Renderer {
       gl.hdrFormat = { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT };
     }
     this.hdr = gl.hdrFormat;
+    // Capabilities the UI may report. hdr 'rgba8': no float render targets, so lighting clips and
+    // night scenes band (the game still runs, at reduced quality).
+    this.caps = { hdr: this.hdr.type === gl.UNSIGNED_BYTE ? 'rgba8' : this.hdr.internal === gl.RGBA16F ? 'rgba16f' : 'rgba32f' };
+    if (this.caps.hdr === 'rgba8') console.warn('[renderer] no float render targets: reduced lighting quality (RGBA8 HDR fallback)');
 
     this.frameUniforms = new FrameUniforms(gl);
     this.albedoTex = createBlockArray(gl, textureSet, textureSet.albedo, gl.SRGB8_ALPHA8);
@@ -144,6 +148,9 @@ export class Renderer {
       s[k] = Number.isFinite(v) ? v : DEFAULTS[k];
     }
     this.settings = s;
+    // While the context is lost GL calls fail (framebuffers come back incomplete); restoring the
+    // context reloads the page, so there is nothing to replay.
+    if (this.gl.isContextLost()) { this._sizeDirty = true; return; }
     const res = [1024, 2048, 4096].includes(Number(s.shadowRes)) ? Number(s.shadowRes) : 2048;
     const maxTex = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE);
     const wantRes = Math.min(res, maxTex);
@@ -174,8 +181,11 @@ export class Renderer {
   // Canvas backing size = CSS size x min(devicePixelRatio, 1.5); render size = canvas x renderScale.
   resize() {
     const c = this.canvas;
+    if (this.gl.isContextLost()) { this._sizeDirty = true; return; }
     this._sizeDirty = false;
-    const dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, MAX_DPR);
+    const rawDpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    this._dpr = rawDpr;   // render() re-checks it: moving between displays changes no CSS size
+    const dpr = Math.min(rawDpr, MAX_DPR);
     const cssW = c.clientWidth, cssH = c.clientHeight;
     let w = c.width, h = c.height;
     if (cssW > 0 && cssH > 0) {
@@ -314,7 +324,8 @@ export class Renderer {
   render(frame) {
     const gl = this.gl;
     if (gl.isContextLost()) return;
-    if (this._sizeDirty) this.resize();
+    const dprNow = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    if (this._sizeDirty || dprNow !== this._dpr) this.resize();
     const s = this.settings;
     const W = this.renderWidth, H = this.renderHeight;
     this.frameIndex++;
@@ -352,7 +363,11 @@ export class Renderer {
     U.vec('uMoonDir', sky.moonDir[0], sky.moonDir[1], sky.moonDir[2], sky.moonVisibility);
     U.vec('uLightDir', sky.lightDir[0], sky.lightDir[1], sky.lightDir[2], sky.lightIsSun ? 1 : 0);
     U.vec('uRes', W, H, 1 / W, 1 / H);
-    U.vec('uCam', NEAR, far, s.renderDistance * 16 - 8, eyeSkyLight);
+    // uCam.z: horizontal distance by which terrain must have dissolved into the void. World
+    // streaming keeps chunks within renderDistance + 0.5 chunk rings of the camera's chunk, so an
+    // unloaded chunk can come as close as ~renderDistance * 16 - 13 blocks.
+    const edgeDist = Math.max(s.renderDistance * 16 - 14, 24);
+    U.vec('uCam', NEAR, far, edgeDist, eyeSkyLight);
     U.vec('uShadow', shadowsOn ? 1 : 0, s.shadowRadius, shadowsOn ? this.shadowRes : 1, LIGHT_ANGULAR_SIZE);
     U.vec('uEnv', underwater ? 1 : 0, this.frameIndex % 65536, cloudCoverage, sky.timeOfDay);
     U.vec('uWind', sky.wind[0], sky.wind[1], sky.starRotation, sky.fogDensity);
@@ -385,8 +400,18 @@ export class Renderer {
     view.underwater = underwater;
     view.eyeSkyLight = eyeSkyLight;
     view.frameIndex = this.frameIndex;
+    view.fogEnd = edgeDist;
 
     this._bindStandardTextures();
+
+    // Far-terrain summary per azimuth (drawn past the loaded area by the sky pass and the fog),
+    // stored after the lighting texels of the irradiance texture. Only uploaded when it changed.
+    const edge = this.terrain.edgeMap && this.hdr.type !== gl.UNSIGNED_BYTE ? this.terrain.edgeMap(camPos, edgeDist) : null;
+    if (edge) {
+      gl.activeTexture(gl.TEXTURE0 + UNIT.IRRADIANCE);
+      gl.bindTexture(gl.TEXTURE_2D, this.atmosphere.irradiance);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, IRRADIANCE_TEXELS, 0, 2 * EDGE_BINS, 1, gl.RGBA, gl.FLOAT, edge);
+    }
 
     // 1. Sky LUT + irradiance (only re-rendered when the sun, moon or altitude moved enough).
     const lutUpdated = this.atmosphere.update(camPos[1]);
@@ -415,18 +440,22 @@ export class Renderer {
     this._defaultState();
 
     // 4. Copies of colour + depth for refraction/SSR, then water and the selection outline.
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.sceneFB);
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.copyFB);
-    gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT, gl.NEAREST);
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFB);
-    gl.viewport(0, 0, W, H);
-    gl.activeTexture(gl.TEXTURE0 + UNIT.PASS0);
-    gl.bindTexture(gl.TEXTURE_2D, this.copyColor);
-    gl.activeTexture(gl.TEXTURE0 + UNIT.PASS0 + 1);
-    gl.bindTexture(gl.TEXTURE_2D, this.copyDepth);
-    this._terrainCall('drawWater', view, st);
+    // (Both skipped when no water mesh is in view: the copy is a full-resolution blit.)
+    const water = !this.terrain.waterVisible || this.terrain.waterVisible(view);
+    if (water) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.sceneFB);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.copyFB);
+      gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFB);
+      gl.viewport(0, 0, W, H);
+      gl.activeTexture(gl.TEXTURE0 + UNIT.PASS0);
+      gl.bindTexture(gl.TEXTURE_2D, this.copyColor);
+      gl.activeTexture(gl.TEXTURE0 + UNIT.PASS0 + 1);
+      gl.bindTexture(gl.TEXTURE_2D, this.copyDepth);
+      this._terrainCall('drawWater', view, st);
+    }
     if (frame.selection && this.overlays.drawSelection) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFB);
       gl.viewport(0, 0, W, H);
@@ -449,9 +478,11 @@ export class Renderer {
       this._run('drawHeld', () => this.overlays.drawHeld(view, frame.held));
     }
 
-    // 7-10. Bloom, exposure, tone map, FXAA to the canvas.
-    post.bloom(!!s.bloom);
-    post.exposureUpdate(frame.dt || 1 / 60);
+    // 7-10. Bloom downsample, exposure (meters a plain downsampled level + the scene depth),
+    // bloom upsample, tone map, FXAA to the canvas.
+    post.downsample(!!s.bloom);
+    post.exposureUpdate(frame.dt || 1 / 60, this.sceneDepth);
+    if (s.bloom) post.upsample();
     const bloomStrength = s.bloom ? 0.05 + 0.035 * sky.night : 0;
     post.finish(this.width, this.height, { fxaa: !!s.fxaa, bloomStrength });
 
@@ -470,7 +501,7 @@ export class Renderer {
     S.quads = st.quads;
     S.shadowDrawCalls = shadowSt.drawCalls;
     S.shadowQuads = shadowSt.quads;
-    S.passes = post.passes + (lutUpdated ? 2 : 0) + 2;   // + sky LUT/irradiance, sky, copy blit
+    S.passes = post.passes + (lutUpdated ? 2 : 0) + 1 + (water ? 1 : 0);   // + sky LUT/irradiance, sky, copy blit
     S.drawCalls = st.drawCalls + shadowSt.drawCalls + S.passes;
     S.width = this.width;
     S.height = this.height;

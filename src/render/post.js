@@ -6,6 +6,7 @@ import { Program, createTexture2D, createFramebuffer, createDepthRenderbuffer, d
 import { GLSL_COMMON, FULLSCREEN_VS } from './common.js';
 
 export const BLOOM_LEVELS = 6;
+const METER_LEVEL = 4;          // bloom level the exposure meters (1/32 of the render size)
 const P0 = UNIT.PASS0;
 
 // ---------------------------------------------------------------------------------------------
@@ -30,7 +31,8 @@ float shadowTap(vec3 posRel) {
 
 vec3 volumetricLight(vec3 dir, float sceneDist) {
   int n = int(uQuality.y + 0.5);
-  if (n <= 0 || uLightDir.y < -0.02) return vec3(0.0);
+  // (Off, light below the horizon, or deep in a cave where the result is faded out anyway.)
+  if (n <= 0 || uLightDir.y < -0.02 || uCam.w <= 0.05 || uVolStrength <= 0.0) return vec3(0.0);
   bool water = uEnv.x > 0.5;
   bool shadows = uShadow.x > 0.5;
   float maxDist = water ? 40.0 : (shadows ? max(uShadow.y * 0.95, 48.0) : 96.0);
@@ -51,26 +53,26 @@ vec3 volumetricLight(vec3 dir, float sceneDist) {
     float dens;
     vec3 tint = vec3(1.0);
     if (water) {
-      // Light shafts below the waves: the refracted surface pattern, absorbed on its way down.
+      // Light shafts below the waves: the refracted surface pattern, absorbed on its way down
+      // and on its way to the eye.
       float depth = max(SEA_LEVEL - wp.y, 0.0);
       vec2 sp = wp.xz + L.xz / max(L.y, 0.2) * depth;
       float shaft = textureLod(uNoise2D, sp * 0.045 + uCamPos.w * vec2(0.011, 0.007), 0.0).a;
-      vis *= 0.25 + 1.5 * shaft * shaft;
-      tint = exp(-vec3(0.34, 0.075, 0.05) * (depth / max(L.y, 0.2)));
-      dens = 0.028;
+      vis *= 0.15 + 1.7 * shaft * shaft;
+      tint = exp(-WATER_EXT * (depth / max(L.y, 0.2) + t));
+      dens = 0.02;
     } else {
       // Height fog: dense in the valleys, thinning with altitude, never quite zero.
       dens = 0.0011 * fogMul * (exp(-max(wp.y - SEA_LEVEL, 0.0) / 34.0) * 0.85 + 0.15);
     }
     vis *= cloudShadow(wp);
     acc += tint * (trans * dens * vis * stepLen);
-    trans *= exp(-dens * stepLen);
+    if (!water) trans *= exp(-dens * stepLen);   // (under water the tint carries the extinction)
   }
   float phase;
   if (water) phase = mix(henyeyGreenstein(mu, 0.8), 1.0 / (4.0 * PI), 0.25) * 4.0 * PI;
-  else phase = mix(henyeyGreenstein(mu, 0.65), 1.0 / (4.0 * PI), 0.3) * 4.0 * PI;
+  else phase = mix(henyeyGreenstein(mu, 0.65), 1.0 / (4.0 * PI), 0.15) * 4.0 * PI;
   vec3 col = acc * phase * lightColor();
-  if (water) col *= vec3(0.3, 0.8, 0.95);
   // Eye sky light keeps caves from glowing where the shadow map can't see.
   return col * uVolStrength * smoothstep(0.05, 0.5, uCam.w);
 }
@@ -228,14 +230,16 @@ uniform float uHalfOn;      // half-res pass ran this frame
 uniform float uFlatClouds;  // cheap 2D cloud layer when volumetric clouds are off
 uniform vec2 uHalfSize;
 
-vec4 flatClouds(vec3 dir) {
-  if (dir.y <= 0.015 || uCamPos.y > CLOUD_BOTTOM) return vec4(0.0);
-  float mid = 0.5 * (CLOUD_BOTTOM + CLOUD_TOP);
-  float t = (mid - uCamPos.y) / dir.y;
-  vec3 p = uCamPos.xyz + dir * t;
-  float cov = cloudCoverage(p.xz);
-  vec2 q = p.xz + uWind.xy * uCamPos.w * 1.15;
-  float detail = texture(uNoise2D, q / 260.0).a * 0.6 + texture(uNoise2D, q / 90.0 + 0.3).b * 0.4;
+// q: world xz where the view ray meets the middle of the cloud layer; gx/gy: its screen-space
+// derivatives (taken in uniform control flow by the caller, so this can run for sky pixels only).
+vec4 flatClouds(vec3 dir, vec2 q0, vec2 gx, vec2 gy, float t) {
+  vec2 p = q0 + uWind.xy * uCamPos.w;
+  float cov = textureGrad(uNoise2D, p / 3072.0, gx / 3072.0, gy / 3072.0).r * 0.65 +
+    textureGrad(uNoise2D, p / 1100.0 + 0.37, gx / 1100.0, gy / 1100.0).g * 0.35;
+  cov = smoothstep(1.0 - uEnv.z, 1.0 - uEnv.z + 0.35, cov);
+  vec2 q = q0 + uWind.xy * uCamPos.w * 1.15;
+  float detail = textureGrad(uNoise2D, q / 260.0, gx / 260.0, gy / 260.0).a * 0.6 +
+    textureGrad(uNoise2D, q / 90.0 + 0.3, gx / 90.0, gy / 90.0).b * 0.4;
   float a = saturate(cov * 1.25 - (1.0 - detail) * 0.45);
   float fade = exp(-max(t - 600.0, 0.0) / 1600.0) * smoothstep(0.015, 0.1, dir.y);
   float mu = dot(dir, uLightDir.xyz);
@@ -252,13 +256,15 @@ void main() {
     float t = uCamPos.w;
     uv += vec2(sin(uv.y * 22.0 + t * 1.9), cos(uv.x * 18.0 + t * 1.6)) * 0.0022;
   }
-  vec3 c = texture(uScene, uv).rgb;
+  vec4 scene = texture(uScene, uv);
+  vec3 c = scene.rgb;
   // Sanitize: a NaN/Inf here would spread through bloom and poison auto exposure.
   if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
   c = max(c, vec3(0.0));
   float depth = texelFetch(uDepth, ivec2(gl_FragCoord.xy), 0).r;
   bool sky = depth >= 1.0;
   float lin = linearDepth(depth) / uCam.y;
+  vec3 volWater = vec3(0.0);
 
   if (uHalfOn > 0.5) {
     // Depth-aware bilinear upsample of the half-res buffers.
@@ -290,27 +296,37 @@ void main() {
     if (wsum > 1e-4) { vol /= wsum; cloud /= wsum; }
     else { vol = bestVol; cloud = bestCloud; }
     c = c * cloud.a + cloud.rgb;
-    c += vol;
+    if (water) volWater = vol; else c += vol;
   }
 
   vec3 posRel = positionFromDepth(vUV, depth);
   vec3 dir = normalize(posRel);
   if (uFlatClouds > 0.5) {
-    // Evaluated for every pixel (uniform control flow keeps the noise mip selection defined at
-    // silhouettes), applied to sky pixels only.
-    vec4 fc = flatClouds(dir);
-    if (sky && !water) c = mix(c, fc.rgb, fc.a);
+    // Cloud-plane hit and its derivatives for every pixel (uniform control flow keeps them
+    // defined at silhouettes); the texture work only runs for sky pixels below the layer.
+    float cy = max(dir.y, 0.015);
+    float tc = (0.5 * (CLOUD_BOTTOM + CLOUD_TOP) - uCamPos.y) / cy;
+    vec2 q0 = uCamPos.xz + dir.xz / cy * (0.5 * (CLOUD_BOTTOM + CLOUD_TOP) - uCamPos.y);
+    vec2 gx = dFdx(q0), gy = dFdy(q0);
+    if (sky && !water && dir.y > 0.015 && uCamPos.y < CLOUD_BOTTOM) {
+      vec4 fc = flatClouds(dir, q0, gx, gy, tc);
+      c = mix(c, fc.rgb, fc.a);
+    }
   }
 
   if (water) {
-    // Underwater: red is absorbed first, then green; in-scatter toward a deep blue-green.
-    float dist = sky ? 96.0 : length(posRel);
-    vec3 tr = exp(-vec3(0.26, 0.068, 0.052) * dist);
-    vec3 lit = lightColor() * max(uLightDir.y, 0.0) * 0.35 + skyIrradiance() * 0.55;
-    vec3 inscatter = lit * vec3(0.035, 0.16, 0.2) * max(uCam.w, 0.06);
-    c = c * tr + inscatter * (1.0 - exp(-0.085 * dist));
+    // Underwater: Beer-Lambert along the view path (red first, then green), in-scattered light of
+    // the water column at the camera's depth, plus the marched light shafts (already absorbed).
+    float dist = sky ? 400.0 : length(posRel);
+    vec3 tr = exp(-WATER_EXT * dist);
+    float camDepth = max(SEA_LEVEL - uCamPos.y, 0.0);
+    // Brighter toward the surface above, darker looking down into the deep.
+    float up = dir.y * 0.5 + 0.5;
+    vec3 inscatter = underwaterLight(max(camDepth + (0.5 - up) * 12.0, 0.0)) * WATER_SCATTER * (0.35 + 0.3 * up) * max(uCam.w, 0.06);
+    c = c * tr + inscatter * (1.0 - tr) + volWater;
   }
-  o = vec4(c, 1.0);
+  // Alpha: 1 - self-emission (from the terrain pass), carried down the bloom chain for metering.
+  o = vec4(c, saturate(scene.a));
 }
 `;
 
@@ -325,6 +341,11 @@ uniform vec2 uSrcTexel;      // 1 / source size
 uniform float uKaris;
 vec3 tap(vec2 off) { return texture(uSrc, vUV + off * uSrcTexel).rgb; }
 float karisW(vec3 c) { return 1.0 / (1.0 + luminance(c)); }
+// Alpha (non-emissive coverage, for exposure metering): plain 4-tap average.
+float alphaAvg() {
+  return 0.25 * (texture(uSrc, vUV + vec2(-1.0, -1.0) * uSrcTexel).a + texture(uSrc, vUV + vec2(1.0, -1.0) * uSrcTexel).a +
+    texture(uSrc, vUV + vec2(-1.0, 1.0) * uSrcTexel).a + texture(uSrc, vUV + vec2(1.0, 1.0) * uSrcTexel).a);
+}
 void main() {
   vec3 a = tap(vec2(-2.0, -2.0)), b = tap(vec2(0.0, -2.0)), c = tap(vec2(2.0, -2.0));
   vec3 d = tap(vec2(-1.0, -1.0)), e = tap(vec2(1.0, -1.0));
@@ -346,7 +367,7 @@ void main() {
     r = g0 * 0.5 + (g1 + g2 + g3 + g4) * 0.125;
   }
   if (any(isnan(r)) || any(isinf(r))) r = vec3(0.0);
-  o = vec4(min(r, vec3(60000.0)), 1.0);
+  o = vec4(min(r, vec3(60000.0)), alphaAvg());
 }
 `;
 
@@ -365,34 +386,73 @@ void main() {
 `;
 
 // ---------------------------------------------------------------------------------------------
-// Auto exposure: centre-weighted log-average luminance of the smallest bloom level, adapted over
-// time in a 1x1 ping-pong target. Stores log2(exposure) remapped to 0..1 (works in RGBA8 too).
+// Auto exposure, adapted over time in a 1x1 ping-pong target (stores log2(exposure) remapped to
+// 0..1 as hi/lo channels, works in RGBA8 too). Metering: 16x9 samples of a 1/32-res bloom level (before the bloom
+// upsample adds into it), weighted toward the centre and lower half, with sky pixels (from the
+// scene depth) counting for little so a bright sunset sky doesn't plunge the terrain into black.
+//  - key: the mid-grey target follows the ambient light of the surroundings (sky irradiance x eye
+//    sky light), so nights and caves stay dark and moody instead of being metered up to grey;
+//  - highlight protection: the brighter half of the non-sky samples may not exceed a ceiling
+//    (low at night), so a torch-lit wall in a dark scene isn't blown out.
 // ---------------------------------------------------------------------------------------------
 const EXPOSURE_FS = GLSL_COMMON + `
 out vec4 o;
-uniform sampler2D uSmall;    // unit 10: smallest bloom level
+uniform sampler2D uMeter;    // unit 10: bloom level (1/32 res), plain downsample
 uniform sampler2D uPrev;     // unit 11: previous exposure
+uniform sampler2D uDepth;    // unit 12: scene depth
 uniform float uDt;
 uniform float uReset;
 float decodeE(float v) { return exp2(v * 10.0 - 5.0); }
 float encodeE(float e) { return clamp((log2(e) + 5.0) / 10.0, 0.0, 1.0); }
+// Stored split into hi/lo channels (r = 8-bit steps, g = fraction): one channel's quantum
+// (fp16 ~0.003 stops, RGBA8 0.04) exceeds a frame's adaptation step at high refresh rates, which
+// would round the update away and leave the exposure stuck short of its target.
+float loadU(vec4 t) { return (floor(t.r * 255.0 + 0.5) + t.g) / 255.0; }
+const int NX = 16, NY = 9;
 void main() {
+  float lg[NX * NY];
+  float wt[NX * NY];
+  float wg[NX * NY];
   float sum = 0.0, wsum = 0.0;
-  for (int y = 0; y < 8; y++) {
-    for (int x = 0; x < 8; x++) {
-      vec2 uv = (vec2(x, y) + 0.5) / 8.0;
-      float l = luminance(textureLod(uSmall, uv, 0.0).rgb);
-      vec2 d = uv - 0.5;
-      float w = exp(-dot(d, d) * 5.0);
-      sum += log2(max(l, 1e-5)) * w;
-      wsum += w;
+  for (int y = 0; y < NY; y++) {
+    for (int x = 0; x < NX; x++) {
+      int i = y * NX + x;
+      vec2 uv = (vec2(x, y) + 0.5) / vec2(NX, NY);
+      vec4 m = textureLod(uMeter, uv, 0.0);
+      float l = luminance(m.rgb);
+      float lit = saturate(m.a);       // share of the area that is not a light source
+      float sky = 0.0;
+      for (int k = 0; k < 4; k++) {
+        vec2 off = (vec2(k & 1, k >> 1) - 0.5) * vec2(0.5 / float(NX), 0.5 / float(NY));
+        sky += step(1.0, textureLod(uDepth, uv + off, 0.0).r) * 0.25;
+      }
+      vec2 d = (uv - vec2(0.5, 0.45)) * vec2(1.0, 1.4);
+      float wPos = exp(-dot(d, d) * 3.0) * mix(1.25, 0.75, uv.y);
+      lg[i] = log2(max(l, 1e-6));
+      wg[i] = (1.0 - sky) * lit;      // lit ground share (no sky, no lava or glowstone)
+      wt[i] = wPos * mix(1.0, 0.2, sky) * mix(0.6, 1.0, lit);
+      sum += lg[i] * wt[i];
+      wsum += wt[i];
     }
   }
-  float avgLog = sum / wsum;
-  // Dim scenes get a lower key so nights read as night and caves stay dark, bright scenes a higher one.
-  float key = mix(0.085, 0.26, smoothstep(-9.0, -1.5, avgLog));
-  float target = clamp(key / exp2(avgLog), 0.3, 9.0);
-  float prev = decodeE(texelFetch(uPrev, ivec2(0), 0).r);
+  float mean = sum / wsum;
+  // Winsorised mean (a sun or a lava pool can't drag it), and the mean of the brighter half of
+  // the ground samples for highlight protection.
+  float s2 = 0.0, hs = 0.0, hw = 0.0;
+  for (int i = 0; i < NX * NY; i++) {
+    float v = clamp(lg[i], mean - 4.0, mean + 2.5);
+    s2 += v * wt[i];
+    if (lg[i] > mean) { hs += lg[i] * wt[i] * wg[i]; hw += wt[i] * wg[i]; }
+  }
+  float avgLog = s2 / wsum;
+  float hiLog = hw > 1e-3 ? hs / hw : avgLog;
+  // Ambient light of the surroundings: ~0 at noon, -3 at sunset, -8 at night, lower in caves.
+  float envLog = log2(max(luminance(skyIrradiance()) * uCam.w * uCam.w, 1e-7));
+  float day = smoothstep(-8.0, -2.5, envLog);
+  float key = mix(0.07, 0.22, day);
+  float ceilingHi = mix(0.32, 2.8, day);
+  float target = clamp(min(key / exp2(avgLog), ceilingHi / exp2(hiLog)), 0.1, 9.0);
+  float prev = decodeE(loadU(texelFetch(uPrev, ivec2(0), 0)));
   float e;
   if (uReset > 0.5 || isnan(prev) || isinf(prev)) {
     e = target;
@@ -402,7 +462,9 @@ void main() {
     e = exp2(mix(log2(prev), log2(target), 1.0 - exp(-uDt * speed)));
   }
   if (isnan(e) || isinf(e)) e = 1.0;
-  o = vec4(encodeE(e), avgLog, 0.0, 1.0);
+  float u = encodeE(e) * 255.0;
+  float hi = floor(u);
+  o = vec4(hi / 255.0, u - hi, avgLog, 1.0);   // b: metered log luminance (debug)
 }
 `;
 
@@ -438,15 +500,18 @@ float hash12(vec2 p) {
 }
 
 void main() {
-  float e = exp2(texelFetch(uExposure, ivec2(0), 0).r * 10.0 - 5.0);
+  vec4 et = texelFetch(uExposure, ivec2(0), 0);
+  float e = exp2(((floor(et.r * 255.0 + 0.5) + et.g) / 255.0) * 10.0 - 5.0);
   vec3 hdr = texture(uHDR, vUV).rgb;
   vec3 c = hdr;
   // The additive upsample sums every level, so normalise by the level count.
   if (uBloomStrength > 0.0) c = mix(c, texture(uBloom, vUV).rgb * ${(1 / BLOOM_LEVELS).toFixed(6)}, uBloomStrength);
+  // Blue shift in genuinely dim light (scotopic vision): judged on the scene radiance before
+  // exposure, so moonlit nights and dark caves turn cool while daytime shadows keep their colour.
+  float lumScene = luminance(c);
   c *= e;
-  // Faint blue shift in very dim light (scotopic vision) for moonlit nights.
   float lum = luminance(c);
-  float scot = (1.0 - smoothstep(0.004, 0.12, lum)) * 0.35;
+  float scot = (1.0 - smoothstep(0.002, 0.05, lumScene)) * 0.4;
   c = mix(c, vec3(lum) * vec3(0.78, 0.9, 1.18), scot);
   c = aces(c * 1.12);
   // Grade: a touch of saturation, then a gentle S-curve for contrast.
@@ -469,7 +534,8 @@ in vec2 vUV;
 out vec4 o;
 uniform sampler2D uTex;   // unit 10
 uniform vec2 uRcp;        // 1 / source size
-const float SUBPIX = 0.75;
+// Low sub-pixel blending: FXAA only smooths geometric edges and must not smear the pixel-art texels.
+const float SUBPIX = 0.3;
 const float EDGE_THRESHOLD = 0.166;
 const float EDGE_THRESHOLD_MIN = 0.0625;
 float lumaAt(vec2 p) { return textureLod(uTex, p, 0.0).a; }
@@ -599,7 +665,7 @@ export class PostProcess {
     this.compositeProgram = mk(COMPOSITE_FS, 'composite', { uScene: P0, uDepth: P0 + 1, uVol: P0 + 2, uCloud: P0 + 3 });
     this.downProgram = mk(DOWN_FS, 'bloom-down', { uSrc: P0 });
     this.upProgram = mk(UP_FS, 'bloom-up', { uSrc: P0 });
-    this.exposureProgram = mk(EXPOSURE_FS, 'exposure', { uSmall: P0, uPrev: P0 + 1 });
+    this.exposureProgram = mk(EXPOSURE_FS, 'exposure', { uMeter: P0, uPrev: P0 + 1, uDepth: P0 + 2 });
     this.tonemapProgram = mk(TONEMAP_FS, 'tonemap', { uHDR: P0, uBloom: P0 + 1, uExposure: P0 + 2 });
     this.fxaaProgram = mk(FXAA_FS, 'fxaa', { uTex: P0 });
     this.copyProgram = mk(COPY_FS, 'copy', { uTex: P0 });
@@ -728,14 +794,16 @@ export class PostProcess {
     gl.clear(gl.DEPTH_BUFFER_BIT);
   }
 
-  // Downsample chain (always: exposure reads its smallest level) + upsample when bloom is on.
-  bloom(enabled) {
+  // Downsample chain (always: exposure meters one of its levels). Only as deep as bloom needs;
+  // without bloom the chain stops at the metering level.
+  downsample(enabled) {
     const gl = this.gl;
     const t = this.targets;
     const levels = t.bloom;
+    const n = enabled ? levels.length : METER_LEVEL + 1;
     const down = this.downProgram.use();
     let srcTex = t.hdrTex, sw = this.width, sh = this.height;
-    for (let i = 0; i < levels.length; i++) {
+    for (let i = 0; i < n; i++) {
       const L = levels[i];
       this._begin(L.fb, L.w, L.h);
       this._bind(P0, srcTex);
@@ -745,29 +813,40 @@ export class PostProcess {
       drawFullscreen(gl);
       srcTex = L.tex; sw = L.w; sh = L.h;
     }
-    if (enabled) {
-      const up = this.upProgram.use();
-      for (let i = levels.length - 2; i >= 0; i--) {
-        const L = levels[i], S = levels[i + 1];
-        this._begin(L.fb, L.w, L.h);
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.ONE, gl.ONE);
-        this._bind(P0, S.tex);
-        up.use();
-        gl.uniform2f(up.u('uSrcTexel'), 1 / S.w, 1 / S.h);
-        drawFullscreen(gl);
-      }
+    this._end();
+  }
+
+  // Tent upsample back up the chain (additive), after exposure has metered the plain levels.
+  upsample() {
+    const gl = this.gl;
+    const levels = this.targets.bloom;
+    const up = this.upProgram.use();
+    for (let i = levels.length - 2; i >= 0; i--) {
+      const L = levels[i], S = levels[i + 1];
+      this._begin(L.fb, L.w, L.h);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE);
+      this._bind(P0, S.tex);
+      up.use();
+      gl.uniform2f(up.u('uSrcTexel'), 1 / S.w, 1 / S.h);
+      drawFullscreen(gl);
     }
     this._end();
   }
 
-  exposureUpdate(dt) {
+  bloom(enabled) {
+    this.downsample(enabled);
+    if (enabled) this.upsample();
+  }
+
+  exposureUpdate(dt, sceneDepth) {
     const gl = this.gl;
     const prev = this.exposure[this.exposureIndex];
     const next = this.exposure[1 - this.exposureIndex];
     this._begin(next.fb, 1, 1);
-    this._bind(P0, this.targets.bloom[this.targets.bloom.length - 1].tex);
+    this._bind(P0, this.targets.bloom[METER_LEVEL].tex);
     this._bind(P0 + 1, prev.tex);
+    this._bind(P0 + 2, sceneDepth);
     const p = this.exposureProgram.use();
     gl.uniform1f(p.u('uDt'), Math.min(Math.max(dt || 0, 0), 0.25));
     gl.uniform1f(p.u('uReset'), this.resetExposure ? 1 : 0);
@@ -780,7 +859,7 @@ export class PostProcess {
   get exposureTexture() { return this.exposure[this.exposureIndex].tex; }
 
   // Tone map, then FXAA (or a straight copy) to the canvas at canvasW x canvasH.
-  finish(canvasW, canvasH, { fxaa, bloomStrength, saturation = 1.08, vignette = 0.22 }) {
+  finish(canvasW, canvasH, { fxaa, bloomStrength, saturation = 1.1, vignette = 0.22 }) {
     const gl = this.gl;
     const t = this.targets;
     const direct = !fxaa && canvasW === this.width && canvasH === this.height;

@@ -1,6 +1,7 @@
 // Settings: defaults, quality presets, the schema the settings screen is built from, persistence.
 
-const STORAGE_KEY = 'blockvale.settings.v1';
+const STORAGE_KEY = 'stereo-sandbox.settings.v1';
+const LEGACY_STORAGE_KEY = 'blockvale.settings.v1'; // before the rename to Stereo Sandbox: read-only fallback
 
 export const QUALITY_PRESETS = {
   low: {
@@ -75,9 +76,9 @@ export const PRESET_KEYS = Object.keys(QUALITY_PRESETS.high);
 export function loadSettings() {
   let saved = {};
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
     if (raw) saved = JSON.parse(raw) || {};
-  } catch (e) { /* storage unavailable */ }
+  } catch (e) { /* storage unavailable or corrupt */ }
   const s = { ...DEFAULT_SETTINGS };
   for (const k in saved) if (k in DEFAULT_SETTINGS) s[k] = saved[k];
   return s;
