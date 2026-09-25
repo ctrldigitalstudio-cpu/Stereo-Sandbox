@@ -95,6 +95,9 @@ export class WorldService {
 
   unload(keys) {
     for (const [cx, cz] of keys || []) this.held.delete(chunkKey(cx, cz));
+    // Acknowledge: a mesh of these chunks main receives before this reply was posted before the
+    // unload (stale, main drops it); one after it answers a newer 'want'.
+    this.post({ type: 'unloaded', keys: keys || [] });
     this._evict();
   }
 
@@ -227,15 +230,15 @@ export class WorldService {
     this.stats.generated++;
   }
 
-  // Free unedited chunk data far from everything main holds or wants (edited chunks are kept:
-  // they are few and likely to be revisited; their edits would survive regeneration anyway).
+  // Free chunk data far from everything main holds or wants. Edited chunks go too: their edits
+  // live in this.edits and are re-applied when the chunk is regenerated, so memory stays bounded.
   _evict() {
     const interest = new Set(this.held);
     for (let j = this.pendingPos; j < this.pending.length; j++) interest.add(this.pending[j]);
     for (const k of this.urgent) interest.add(k);
     const R = this.keepRadius;
     for (const [k, c] of this.chunks) {
-      if (c.edited || interest.has(k)) continue;
+      if (interest.has(k)) continue;
       let near = false;
       for (let dz = -R; dz <= R && !near; dz++) {
         for (let dx = -R; dx <= R; dx++) {

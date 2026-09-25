@@ -25,7 +25,7 @@ export function createGL(canvas) {
   const gl = canvas.getContext('webgl2', {
     antialias: false,
     alpha: false,
-    depth: true,
+    depth: false, // every pass renders into its own targets; the canvas only receives the final image
     stencil: false,
     premultipliedAlpha: false,
     preserveDrawingBuffer: false,

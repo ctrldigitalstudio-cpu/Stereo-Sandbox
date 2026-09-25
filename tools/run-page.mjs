@@ -12,7 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import { chromium } from 'playwright';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -45,9 +45,9 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
 const [w, h] = opt('size', '960x540').split('x').map(Number);
-const browser = await chromium.launch({
-  args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'],
-});
+// Software GL by default (works anywhere, deterministic); PW_GPU=1 uses the machine's GPU.
+const glArgs = process.env.PW_GPU ? ['--ignore-gpu-blocklist', '--enable-gpu'] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
+const browser = await chromium.launch({ args: [...glArgs, '--autoplay-policy=no-user-gesture-required'] });
 const page = await browser.newPage({ viewport: { width: w, height: h } });
 let failed = false;
 page.on('console', (m) => {
