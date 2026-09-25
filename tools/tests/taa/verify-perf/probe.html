@@ -1,0 +1,167 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" style="width:800px;height:450px;display:block"></canvas>
+<script type="module">
+// Perf/regression probe (verifier scratch). Instruments WebGL2 to count live GPU objects + bytes,
+// draw calls per pass (label, viewport, pixels) and GL errors. ?src=head uses the pre-TAA tree
+// exported to ./head/src; default uses the working tree. ?mode=leak | cost. ?rgba8. ?time=1.
+const Q = new URLSearchParams(location.search);
+const SRC = Q.get('src') === 'head' ? './head/src' : '../../../../src';
+const MODE = Q.get('mode') || 'cost';
+const TIME = Q.get('time') === '1';
+if (Q.has('rgba8')) {
+  const orig = WebGL2RenderingContext.prototype.getExtension;
+  WebGL2RenderingContext.prototype.getExtension = function (name) {
+    return /color_buffer_(half_)?float/i.test(name) ? null : orig.call(this, name);
+  };
+}
+const P = WebGL2RenderingContext.prototype;
+const live = { texture: new Set(), framebuffer: new Set(), renderbuffer: new Set(), buffer: new Set(), program: new Set(), vao: new Set(), sampler: new Set(), query: new Set() };
+const texBytes = new Map(), rbBytes = new Map();
+const created = { texture: 0, framebuffer: 0, renderbuffer: 0 };
+const texCreatedSizes = [];
+let unit = 0; const bound2D = new Map(); let boundRB = null;
+const wrapCD = (cn, dn, key) => {
+  const c = P[cn], d = P[dn];
+  P[cn] = function (...a) { const o = c.apply(this, a); if (o) { live[key].add(o); if (key in created) created[key]++; } return o; };
+  P[dn] = function (o) { if (o) { live[key].delete(o); texBytes.delete(o); rbBytes.delete(o); } return d.call(this, o); };
+};
+wrapCD('createTexture', 'deleteTexture', 'texture');
+wrapCD('createFramebuffer', 'deleteFramebuffer', 'framebuffer');
+wrapCD('createRenderbuffer', 'deleteRenderbuffer', 'renderbuffer');
+wrapCD('createBuffer', 'deleteBuffer', 'buffer');
+wrapCD('createProgram', 'deleteProgram', 'program');
+wrapCD('createVertexArray', 'deleteVertexArray', 'vao');
+wrapCD('createSampler', 'deleteSampler', 'sampler');
+wrapCD('createQuery', 'deleteQuery', 'query');
+const oAT = P.activeTexture; P.activeTexture = function (u) { unit = u - this.TEXTURE0; return oAT.call(this, u); };
+const oBT = P.bindTexture; P.bindTexture = function (t, tex) { if (t === this.TEXTURE_2D) bound2D.set(unit, tex); return oBT.call(this, t, tex); };
+const oBR = P.bindRenderbuffer; P.bindRenderbuffer = function (t, rb) { boundRB = rb; return oBR.call(this, t, rb); };
+const BPP = (gl, f) => ({ [gl.RGBA16F]: 8, [gl.RGBA32F]: 16, [gl.RGBA8]: 4, [gl.SRGB8_ALPHA8]: 4, [gl.DEPTH_COMPONENT24]: 4, [gl.R8]: 1, [gl.RG16F]: 4, [gl.R16F]: 2 })[f] || 4;
+const oTI = P.texImage2D; P.texImage2D = function (...a) {
+  if (a.length >= 9 && a[0] === this.TEXTURE_2D && a[1] === 0) {
+    const tex = bound2D.get(unit);
+    if (tex) { texBytes.set(tex, a[3] * a[4] * BPP(this, a[2])); texCreatedSizes.push(`${a[3]}x${a[4]}`); }
+  }
+  return oTI.apply(this, a);
+};
+const oRS = P.renderbufferStorage; P.renderbufferStorage = function (t, f, w, h) { if (boundRB) rbBytes.set(boundRB, w * h * BPP(this, f)); return oRS.call(this, t, f, w, h); };
+// Draw tracking
+let vp = [0, 0, 0, 0]; let curProg = null; const labels = new Map(); let passLog = null; let curFB = null; const fbInfo = new Map();
+const oVP = P.viewport; P.viewport = function (x, y, w, h) { vp = [x, y, w, h]; return oVP.call(this, x, y, w, h); };
+const oUP = P.useProgram; P.useProgram = function (p) { curProg = p; return oUP.call(this, p); };
+const oBF = P.bindFramebuffer; P.bindFramebuffer = function (t, fb) { if (t === this.FRAMEBUFFER || t === this.DRAW_FRAMEBUFFER) curFB = fb; return oBF.call(this, t, fb); };
+let glRef = null;
+const rec = (kind, count) => {
+  if (!passLog) return;
+  const e = { label: labels.get(curProg) || 'unk', kind, w: vp[2], h: vp[3], fb: curFB ? 'fbo' : 'canvas', count };
+  if (TIME && glRef) { glRef.finish(); }
+  passLog.push(e);
+  return e;
+};
+for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+  const o = P[name];
+  P[name] = function (...a) {
+    let t0 = 0; if (TIME) { this.finish(); t0 = performance.now(); }
+    const r = o.apply(this, a);
+    const e = rec(name === 'drawArrays' && a[2] === 3 ? 'fs' : 'geo', a[name.startsWith('drawArrays') ? 2 : 1]);
+    if (TIME && e) e.ms = performance.now() - t0;
+    return r;
+  };
+}
+const oBlit = P.blitFramebuffer; P.blitFramebuffer = function (...a) { if (passLog) passLog.push({ label: 'blit', kind: 'blit', w: a[6] - a[4], h: a[7] - a[5] }); return oBlit.apply(this, a); };
+
+const { Program } = await import(SRC + '/gl.js');
+const oUse = Program.prototype.use;
+Program.prototype.use = function () { labels.set(this.program, this.label); return oUse.call(this); };
+const { buildTextures } = await import(SRC + '/textures.js');
+const { Renderer } = await import(SRC + '/renderer.js');
+
+const out = { src: SRC, mode: MODE, errors: [] };
+const snapshot = () => {
+  let tb = 0; for (const [t, b] of texBytes) if (live.texture.has(t)) tb += b;
+  let rb = 0; for (const [t, b] of rbBytes) if (live.renderbuffer.has(t)) rb += b;
+  const o = {}; for (const k in live) o[k] = live[k].size;
+  o.texMB = +(tb / 1048576).toFixed(3); o.rbMB = +(rb / 1048576).toFixed(3);
+  return o;
+};
+try {
+  const canvas = document.getElementById('c');
+  const tex = buildTextures();
+  const base = { renderDistance: 4, shadowRes: 1024, shadowRadius: 64, volumetrics: 12, clouds: 10, ssr: 16, bloom: true, shadows: true, pcss: true };
+  const r = new Renderer(canvas, tex, { ...base, aa: 'taa', renderScale: 1 });
+  const gl = r.gl; glRef = gl;
+  const drain = () => { const e = []; for (let i = 0; i < 10; i++) { const x = gl.getError(); if (!x) break; e.push('0x' + x.toString(16)); } return e; };
+  let yaw = 0.3, t = 0;
+  const frame = (extra = {}) => {
+    yaw += 0.01; t += 1 / 60;
+    r.render({ camPos: [0.5, 80, 0.5], yaw, pitch: 0.1, fov: 1.3, time: t, dt: 1 / 60, timeOfDay: 0.3, eyeSkyLight: 1, cloudCoverage: 0.5,
+      held: { blockId: 1, swing: 0, equip: 0, bobX: 0, bobY: 0, light: [1, 0] }, ...extra });
+  };
+  out.init = drain();
+  if (MODE === 'leak') {
+    const cfgs = [
+      { aa: 'taa', renderScale: 1 }, { aa: 'taa', renderScale: 0.5 }, { aa: 'taa', renderScale: 0.75, shadows: false },
+      { aa: 'fxaa', renderScale: 0.75 }, { aa: 'off', renderScale: 1 }, { aa: 'off', renderScale: 0.6, volumetrics: 0, clouds: 0 },
+      { aa: 'taa', renderScale: 0.85, volumetrics: 0, clouds: 0, shadows: false }, { aa: 'taa', renderScale: 0.55, _uw: true },
+      { aa: 'fxaa', renderScale: 1, shadows: false, _uw: true }, { aa: 'taa', renderScale: 1, _w: 640 }, { aa: 'fxaa', renderScale: 0.9, _w: 800 },
+      { aa: 'taa', renderScale: 0.7, shadowRes: 2048 }, { aa: 'taa', renderScale: 0.7, shadowRes: 1024 },
+    ];
+    const rows = [];
+    let baselineCreated = null;
+    for (let cycle = 0; cycle < 4; cycle++) {
+      for (let i = 0; i < cfgs.length; i++) {
+        const c = cfgs[i];
+        if (c._w) { canvas.style.width = c._w + 'px'; r.resize(); }
+        const { _w, _uw, ...s } = c;
+        r.applySettings({ ...base, ...s });
+        frame({ underwater: !!_uw });
+        frame({ underwater: !!_uw });
+        const err = drain();
+        if (err.length) out.errors.push(`cycle ${cycle} cfg ${i} ${JSON.stringify(c)}: ${err.join(',')}`);
+        rows.push({ cycle, i, ...snapshot(), aa: r.stats.aa, rw: r.stats.renderWidth, w: r.stats.width });
+      }
+      if (cycle === 0) baselineCreated = { ...created };
+    }
+    // Same config at the same position of each cycle must hold the same live objects.
+    const byI = {};
+    for (const row of rows) (byI[row.i] ||= []).push(`${row.texture}/${row.framebuffer}/${row.renderbuffer}/${row.texMB}/${row.rbMB}`);
+    out.leakCheck = Object.entries(byI).map(([i, v]) => `${i}: ${new Set(v).size === 1 ? 'stable' : 'CHANGES'} ${v.join(' | ')}`);
+    out.createdTotals = created;
+    // adaptive-style renderScale sweep with TAA: count output-size allocations
+    canvas.style.width = '800px'; r.resize();
+    r.applySettings({ ...base, aa: 'taa', renderScale: 0.85 }); frame(); frame();
+    const hist0 = r.post.taa.targets.history[0];
+    const n0 = texCreatedSizes.length;
+    for (const sc of [0.75, 0.65, 0.55, 0.5, 0.6, 0.7, 0.8, 0.85, 0.95, 1, 0.9]) { r.applySettings({ ...base, aa: 'taa', renderScale: sc }); frame(); }
+    const sizes = texCreatedSizes.slice(n0);
+    out.scaleSweep = { historyKept: r.post.taa.targets.history[0] === hist0, historyOk: r.post.taa.historyOk, newTexSizes: sizes.join(' '), canvasSized: sizes.filter((s) => s === `${r.width}x${r.height}`).length, errors: drain() };
+    r.dispose();
+    out.afterDispose = snapshot();
+    out.disposeErr = drain();
+  } else {
+    const cfgs = JSON.parse(Q.get('cfgs') || '[]');
+    out.results = [];
+    for (const c of cfgs) {
+      const { _uw, _label, ...s } = c;
+      r.applySettings({ ...base, ...s });
+      for (let k = 0; k < 3; k++) frame({ underwater: !!_uw });
+      const reps = TIME ? 3 : 1;
+      const logs = [];
+      for (let k = 0; k < reps; k++) { passLog = []; frame({ underwater: !!_uw }); logs.push(passLog); passLog = null; }
+      const err = drain();
+      const mem = snapshot();
+      const log = logs[logs.length - 1];
+      const agg = {};
+      logs.forEach((lg, li) => lg.forEach((e) => {
+        const key = `${e.label}@${e.w}x${e.h}${e.kind === 'fs' ? '' : ':' + e.kind}`;
+        const a = (agg[key] ||= { n: 0, px: 0, ms: [] });
+        if (li === logs.length - 1) { a.n++; a.px += e.kind === 'fs' ? e.w * e.h : 0; }
+        if (e.ms !== undefined) a.ms.push(e.ms);
+      }));
+      for (const k in agg) { const a = agg[k]; if (a.ms.length) { a.ms = +(a.ms.reduce((x, y) => x + y, 0) / reps).toFixed(1); } else delete a.ms; }
+      out.results.push({ cfg: _label || JSON.stringify(c), aa: r.stats.aa, rw: r.stats.renderWidth, rh: r.stats.renderHeight, w: r.stats.width, h: r.stats.height, passes: r.stats.passes, mem, err, agg });
+    }
+  }
+} catch (e) { out.errors.push('EXCEPTION ' + (e.stack || e.message)); }
+window.__out = JSON.stringify(out);
+window.__done = true;
+</script>

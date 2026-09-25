@@ -1,0 +1,52 @@
+<!doctype html>
+<html><body style="margin:0;background:#000">
+<canvas id="c" style="width:320px;height:180px;display:block"></canvas>
+<script type="module">
+// Review check: what the RGBA8 HDR fallback (no EXT_color_buffer_float / _half_float) stores in the
+// irradiance texture, sky LUT and exposure target, compared with the RGBA16F path.
+const noFloat = location.search.includes('nofloat');
+if (noFloat) {
+  const P = WebGL2RenderingContext.prototype, ge = P.getExtension;
+  P.getExtension = function (n) { return (n === 'EXT_color_buffer_float' || n === 'EXT_color_buffer_half_float') ? null : ge.call(this, n); };
+}
+const { Renderer } = await import('../../../../src/renderer.js');
+const { buildTextures } = await import('../../../../src/textures.js');
+const canvas = document.getElementById('c');
+const r = new Renderer(canvas, buildTextures(), { shadows: false, volumetrics: 0, clouds: 0, ssr: 0, autoResolution: false, renderScale: 1 });
+const gl = r.gl;
+function readTex(tex, w, h) {
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  let out;
+  if (r.hdr.internal === gl.RGBA8) { const px = new Uint8Array(w * h * 4); gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px); out = Array.from(px, (v) => v / 255); }
+  else { const px = new Float32Array(w * h * 4); gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, px); out = Array.from(px); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.deleteFramebuffer(fb);
+  return out.map((v) => +v.toPrecision(4));
+}
+const res = { hdr: r.hdr.internal === gl.RGBA8 ? 'RGBA8' : 'RGBA16F', glErrors: [] };
+for (const [name, tod, pitch] of [['noon', 0.25, 0.6], ['night', 0.78, 0.4]]) {
+  for (let i = 0; i < 4; i++) {
+    r.render({ camPos: [0.5, 80, 0.5], yaw: 0, pitch, fov: 1.3, time: i / 60, dt: 1 / 60, timeOfDay: tod, underwater: false, eyeSkyLight: 1, cloudCoverage: 0 });
+    const e = gl.getError(); if (e) res.glErrors.push(name + ':0x' + e.toString(16));
+  }
+  const irr = readTex(r.atmosphere.irradiance, 4, 1);
+  // Sky LUT column at azimuth 0: a few elevations (rows) from horizon to zenith.
+  const lut = readTex(r.atmosphere.skyLUT, 256, 128);
+  const rows = [64, 70, 90, 127].map((y) => lut.slice((y * 256 + 64) * 4, (y * 256 + 64) * 4 + 3));
+  // Distinct values in the whole upper half of the LUT (quantisation of the night sky)
+  const distinct = new Set();
+  for (let y = 64; y < 128; y++) for (let x = 0; x < 256; x++) distinct.add(lut[(y * 256 + x) * 4 + 2]);
+  // Canvas: distinct blue values in the sky region (banding)
+  const px = new Uint8Array(4 * 320 * 90);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  res[name] = {
+    irradiance: { skyIrr: irr.slice(0, 3), groundIrr: irr.slice(4, 7), lightColor: irr.slice(8, 11), sunDisk: irr.slice(12, 15) },
+    skyLUT_rows_h0_h6_h26_zenith: rows,
+    lutUpperHalfDistinctBlue: distinct.size,
+    exposure: readTex(r.post.exposureTexture, 1, 1).slice(0, 1),
+  };
+}
+window.__res = res;
+window.__done = true;
+</script></body></html>

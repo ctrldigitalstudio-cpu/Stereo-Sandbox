@@ -1,0 +1,6 @@
+<!doctype html><script type="module">
+const mods = ['math','noise','blocks','gl','vertex','config','textures','worldgen','mesher','particles','render/common','render/terrain','render/overlays','render/atmosphere','render/post','renderer','world','player','input','audio','ui'];
+const out = {};
+for (const m of mods) { try { await import('../../../../src/' + m + '.js'); out[m] = 'ok'; } catch (e) { out[m] = String(e && (e.stack || e.message)); } }
+window.__res = out; window.__done = true;
+</script>

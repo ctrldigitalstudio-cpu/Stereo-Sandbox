@@ -119,9 +119,9 @@ float shadowVisibility(vec3 posRel, vec3 offsetDir, float fallback, bool soft, o
   sc.z -= 0.00005;
   float texel = 1.0 / uShadow.z;
   float uvPerBlock = (1.0 - SHADOW_DISTORT) / (2.0 * uShadow.y * f * f);
-  // Static per-pixel rotation: there is no temporal accumulation, so a per-frame pattern would
-  // only make penumbrae crawl.
-  float a = ign(gl_FragCoord.xy) * 6.2831853;
+  // Per-pixel rotation of the kernel: static without TAA (a per-frame pattern would only make
+  // penumbrae crawl), per frame with it (the resolve averages the rotations into smooth penumbrae).
+  float a = ignTemporal(gl_FragCoord.xy) * 6.2831853;
   mat2 rot = mat2(cos(a), sin(a), -sin(a), cos(a));
   float vis = 0.0;
   float thickness;
@@ -200,6 +200,7 @@ out vec3 vTint;
 flat out uint vLayer;
 flat out uint vFace;
 flat out uint vFlags;
+out vec2 vMotion;
 
 void main() {
   vec3 local = blockLocalPos();
@@ -223,6 +224,16 @@ void main() {
   if (facing > 0.0 && !plant) posRel += FACE_N[face] * 0.004;
 
   vec3 wave = waveOffset(world, flags, uCamPos.w);
+  // TAA motion vector of a waving vertex (the resolve reprojects everything else as static world):
+  // NDC offset between where it really was last frame (previous wind phase) and where a static point
+  // at its current position would reproject to.
+  vMotion = vec2(0.0);
+  if (uTAAInfo.z > 0.5 && (flags & (FLAG_WAVE_LEAVES | FLAG_WAVE_PLANT)) != 0u) {
+    vec3 prevWave = waveOffset(world, flags, uTAAInfo.y);
+    vec4 a = uPrevViewProj * vec4(posRel + wave + uCamDelta.xyz, 1.0);
+    vec4 b = uPrevViewProj * vec4(posRel + prevWave + uCamDelta.xyz, 1.0);
+    if (a.w > 1e-3 && b.w > 1e-3) vMotion = b.xy / b.w - a.xy / a.w;
+  }
   posRel += wave;
   world += wave;
 
@@ -259,10 +270,13 @@ in vec3 vTint;
 flat in uint vLayer;
 flat in uint vFace;
 flat in uint vFlags;
+in vec2 vMotion;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+layout(location = 1) out vec4 fragMotion;   // TAA: xy = NDC motion beyond the static-world reprojection, z = reactive
 
 void main() {
+  fragMotion = vec4(vMotion, 0.0, 0.0);
   float t = uCamPos.w;
   bool plant = (vFlags & FLAG_PLANT) != 0u;
   bool leaves = (vFlags & FLAG_WAVE_LEAVES) != 0u;
@@ -272,7 +286,8 @@ void main() {
 
   // ---- Material ----
   vec2 uv = vUV;
-  vec2 gx = dFdx(uv), gy = dFdy(uv);
+  // (Texture footprint in output pixels: TAAU mip bias, see footprintScale.)
+  vec2 gx = dFdx(uv) * footprintScale(), gy = dFdy(uv) * footprintScale();
   if (lava) {
     // Slow churning flow: world-space noise distortion (continuous across blocks) + drift
     vec2 wp = vWorld.xz + vWorld.y * 0.37;
@@ -281,7 +296,7 @@ void main() {
     uv += n1 * 0.55 + n2 * 0.18 + vec2(t * 0.013, t * 0.021);
     uv = fract(uv); // derivatives come from the unwrapped uv, so no seams at the wrap
   }
-  vec3 tc = vec3(pixelArtUV(uv, !lava), float(vLayer));
+  vec3 tc = vec3(pixelArtUVOut(uv, !lava), float(vLayer));
   vec4 albedo = textureGrad(uAlbedo, tc, gx, gy);
   // Leaf canopies are hollow shells (faces between leaf blocks are culled). Seen from inside, a
   // hole shows dense shadowed foliage instead of the sky, so trees read as full crowns rather
@@ -476,7 +491,8 @@ in vec2 vLight;
 in vec3 vTint;
 flat in uint vFace;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+layout(location = 1) out vec4 fragMotion;   // TAA: the water surface is static geometry (no extra motion)
 
 // Wave height field: three scrolled noise layers at different scales and directions.
 float waveHeight(vec2 p, float t) {
@@ -551,6 +567,7 @@ vec3 traceSSR(vec3 origin, vec3 R, float jitter, out float hit) {
 }
 
 void main() {
+  fragMotion = vec4(0.0);
   float t = uCamPos.w;
   vec3 posRel = vPosRel;
   float dist = length(posRel);
@@ -613,7 +630,7 @@ void main() {
     vec3 refl = skyReflection(R, vWorld) * skyVis;
     if (uQuality.x > 0.5) {
       float hit;
-      vec3 ssr = traceSSR(posRel + Ng * 0.02, R, ign(gl_FragCoord.xy), hit);
+      vec3 ssr = traceSSR(posRel + Ng * 0.02, R, ignTemporal(gl_FragCoord.xy), hit);
       refl = mix(refl, ssr, hit);
     }
     float NdotV = max(dot(N, V), 0.0);

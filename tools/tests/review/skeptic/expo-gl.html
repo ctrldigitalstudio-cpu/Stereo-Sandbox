@@ -1,0 +1,39 @@
+<!doctype html><html><body><canvas id="c" width="4" height="4"></canvas><script type="module">
+// Minimal GL check: the exact EXPOSURE_FS update + encode on a 1x1 RGBA16F / RGBA8 ping-pong.
+const gl = document.getElementById('c').getContext('webgl2');
+const hasF = !!gl.getExtension('EXT_color_buffer_float');
+const vs = `#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position = vec4(p*2.0-1.0,0,1);} `;
+const fs = `#version 300 es
+precision highp float; out vec4 o; uniform sampler2D uPrev; uniform float uDt; uniform float uTarget;
+float decodeE(float v) { return exp2(v * 10.0 - 5.0); }
+float encodeE(float e) { return clamp((log2(e) + 5.0) / 10.0, 0.0, 1.0); }
+void main(){ float target = exp2(uTarget); float prev = decodeE(texelFetch(uPrev, ivec2(0), 0).r);
+ float speed = target > prev ? 1.1 : 2.6; float e = exp2(mix(log2(prev), log2(target), 1.0 - exp(-uDt * speed)));
+ o = vec4(encodeE(e), 0.0, 0.0, 1.0);} `;
+const sh = (t, s) => { const x = gl.createShader(t); gl.shaderSource(x, s); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(x); return x; };
+const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); gl.useProgram(p);
+const out = { hasFloat: hasF };
+for (const fmt of (hasF ? ['f16', 'u8'] : ['u8'])) {
+  const mk = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    if (fmt === 'f16') gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 1, 1, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return { t, fb }; };
+  const pp = [mk(), mk()];
+  const read = (i) => { gl.bindFramebuffer(gl.FRAMEBUFFER, pp[i].fb); let v;
+    if (fmt === 'f16') { const a = new Float32Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, a); v = a[0]; } else { const a = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, a); v = a[0] / 255; }
+    return v * 10 - 5; };
+  const set = (l) => { const u = (l + 5) / 10; for (const x of pp) { gl.bindTexture(gl.TEXTURE_2D, x.t);
+    if (fmt === 'f16') gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RGBA, gl.FLOAT, new Float32Array([u, 0, 0, 1]));
+    else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([Math.round(u * 255), 0, 0, 255])); } gl.bindTexture(gl.TEXTURE_2D, null); };
+  for (const hz of [60, 144, 240]) for (const [a, b] of [[0, 2], [1, Math.log2(9)], [-0.5, 0.5], [0.5, -0.5]]) {
+    set(a); let i = 0;
+    gl.uniform1f(gl.getUniformLocation(p, 'uDt'), 1 / hz); gl.uniform1f(gl.getUniformLocation(p, 'uTarget'), b); gl.uniform1i(gl.getUniformLocation(p, 'uPrev'), 0);
+    gl.viewport(0, 0, 1, 1); gl.activeTexture(gl.TEXTURE0);
+    for (let n = 0; n < hz * 30; n++) { gl.bindFramebuffer(gl.FRAMEBUFFER, pp[1 - i].fb); gl.bindTexture(gl.TEXTURE_2D, pp[i].t); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindTexture(gl.TEXTURE_2D, null); i = 1 - i; }
+    out[`${fmt} ${hz}Hz ${a.toFixed(2)}->${b.toFixed(2)}`] = +(read(i) - b).toFixed(3);
+  }
+}
+window.__res = out; window.__done = true;
+</script></body></html>

@@ -237,6 +237,10 @@ void main() {
   // Sun, moon and stars sink into the horizon haze.
   float horizon = smoothstep(-0.012, 0.012, dir.y) * skyHazeT(dir.y);
   float pixAngle = 2.0 / (uProj[1][1] * uRes.y);
+  // Edge AA of the sun and moon disks: one pixel of the image the player sees (an output pixel
+  // with temporal upscaling). Stars stay about a render pixel wide: a point source smaller than
+  // the render grid would be missed by most jittered samples and flicker.
+  float edgeAngle = pixAngle * footprintScale();
 
   // Stars appear as the sky darkens (brightest first) and are dimmed by extinction near the horizon.
   float skyLum = luminance(col);
@@ -253,7 +257,7 @@ void main() {
     vec3 up = cross(right, M);
     vec2 q = vec2(dot(dir, right), dot(dir, up)) / MOON_R;
     float r2 = dot(q, q);
-    float aa = pixAngle / MOON_R;
+    float aa = edgeAngle / MOON_R;
     moonMask = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, sqrt(r2));
     if (moonMask > 0.0) {
       vec3 n = vec3(q, sqrt(max(1.0 - r2, 0.0)));
@@ -276,7 +280,7 @@ void main() {
   float cs = dot(dir, S);
   if (cs > 0.999) {
     float r = length(cross(dir, S)) / SUN_R;
-    float aa = pixAngle / SUN_R;
+    float aa = edgeAngle / SUN_R;
     float disk = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
     float mu = sqrt(max(1.0 - r * r, 0.0));
     float limb = 1.0 - 0.56 * (1.0 - mu) - 0.2 * (1.0 - mu * mu);

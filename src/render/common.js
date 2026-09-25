@@ -35,8 +35,16 @@ export const FRAME_OFFSETS = {
   uEnv: 108,         // vec4 x = camera underwater 0/1, y = frame index, z = cloud coverage 0..1, w = time of day 0..1
   uWind: 112,        // vec4 xy = cloud wind velocity (blocks/s), z = star-field rotation (radians), w = fog density multiplier
   uQuality: 116,     // vec4 x = SSR steps (0 = off), y = volumetric steps (0 = off), z = cloud steps (0 = off), w = PCSS 0/1
+  // Temporal anti-aliasing. With TAA on, uProj / uViewProj / uInvViewProj above carry this frame's
+  // sub-pixel jitter (so every pass that rasterises or reconstructs view rays is jittered alike);
+  // the matrices below never are.
+  uPrevViewProj: 120, // mat4 previous frame's UNJITTERED view-projection (camera-relative to the previous camera)
+  uTAA: 136,         // vec4 xy = jitter in render pixels (the image moves by +xy), z = TAA on 0/1, w = history valid 0/1
+  uCamDelta: 140,    // vec4 xyz = camPos - prevCamPos (blocks, computed in doubles), w = 0
+  uTAAInfo: 144,     // vec4 x = texture footprint scale (render px / output px: 1 without TAA, renderScale with it),
+                     //      y = previous frame's time (seconds, clock of uCamPos.w), z = scene motion vectors written 0/1, w = 0
 };
-export const FRAME_FLOATS = 120;
+export const FRAME_FLOATS = 148;
 
 export class FrameUniforms {
   constructor(gl) {
@@ -109,6 +117,10 @@ layout(std140) uniform Frame {
   vec4 uEnv;
   vec4 uWind;
   vec4 uQuality;
+  mat4 uPrevViewProj;
+  vec4 uTAA;
+  vec4 uCamDelta;
+  vec4 uTAAInfo;
 };
 `;
 
@@ -141,6 +153,14 @@ float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // Interleaved gradient noise, animated per frame (for dithering ray marches)
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float ignFrame(vec2 p) { return ign(p + 5.588238 * mod(uEnv.y, 64.0)); }
+// Temporal anti-aliasing accumulates over frames: dither patterns may then change every frame
+// (the resolve averages them away); without it a moving pattern would only crawl.
+bool taaOn() { return uTAA.z > 0.5; }
+float ignTemporal(vec2 p) { return taaOn() ? ignFrame(p) : ign(p); }
+// Temporal upscaling reconstructs the image at the OUTPUT resolution, so a screen-space footprint
+// measured in render pixels (texture LOD, pixel-art seams, pixel-sized edge AA) is scaled to output
+// pixels: a mip bias of log2(renderScale). 1 without TAA (the final pass upscales the render image).
+float footprintScale() { return uTAAInfo.x > 0.0 ? uTAAInfo.x : 1.0; }
 
 // ---- Pixel-art texturing -----------------------------------------------------------------
 // Block textures use LINEAR magnification + anisotropic minification. D3D11 (Chrome on Windows)
@@ -159,6 +179,11 @@ vec2 pixelArtUVd(vec2 uv, vec2 dTexels, bool clampTexels) {
   return s / 16.0;
 }
 #define pixelArtUV(uv, clampTexels) pixelArtUVd((uv), fwidth((uv) * 16.0), (clampTexels))
+// The same for passes that the TAA resolve reconstructs at the output resolution (terrain,
+// particles): the texel footprint in OUTPUT pixels. Pair it with textureGrad derivatives scaled by
+// footprintScale(). (The held item is drawn at the output size and the shadow pass in shadow-map
+// texels: they keep pixelArtUV.)
+#define pixelArtUVOut(uv, clampTexels) pixelArtUVd((uv), fwidth((uv) * 16.0) * footprintScale(), (clampTexels))
 
 // ---- Depth -------------------------------------------------------------------------------
 float linearDepth(float d) {

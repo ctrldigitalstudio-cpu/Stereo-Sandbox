@@ -90,10 +90,14 @@ in vec3 vTint;
 in vec2 vLight;
 in float vWater;
 flat in vec3 vCenter;
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+// TAA: particles move on their own (no motion vectors): z = reactive, the resolve keeps little
+// history there instead of smearing them.
+layout(location = 1) out vec4 fragMotion;
 void main() {
-  vec3 tc = vec3(pixelArtUV(vUV.xy, false), vUV.z);
-  vec2 gx = dFdx(vUV.xy), gy = dFdy(vUV.xy);
+  fragMotion = vec4(0.0, 0.0, 1.0, 0.0);
+  vec3 tc = vec3(pixelArtUVOut(vUV.xy, false), vUV.z);
+  vec2 gx = dFdx(vUV.xy) * footprintScale(), gy = dFdy(vUV.xy) * footprintScale();
   vec4 albedo = textureGrad(uAlbedo, tc, gx, gy);
   if (albedo.a < 0.5) discard;
   vec4 spec = textureGrad(uSpecular, tc, gx, gy);
@@ -116,11 +120,26 @@ void main() {
 `;
 
 // ---------------------------------------------------------------------------------------------
-// Held block: own projection, lit like the world at the eye.
+// Held block: own projection, lit like the world at the eye. It is drawn after the TAA resolve
+// (never jittered, never accumulated), so its outline is anti-aliased analytically instead: each
+// cube face is pushed out by one pixel across its silhouette edges (edges whose other face looks
+// away from the eye) and fades from full to zero coverage over the pixel either side of the true
+// edge; the front and back planes of flat sprites get a one-pixel alpha coverage ramp, and their
+// 1/16-deep side walls (seen at a grazing angle they are thinner than a pixel, bright with Fresnel,
+// and rasterise as a dotted line) have their silhouette edge pushed out on screen, perpendicular
+// to the wall, to at least two pixels and are box-filtered back to their true width. The result
+// is alpha-blended over the scene.
 // ---------------------------------------------------------------------------------------------
 const HELD_VS = GLSL_COMMON + GLSL_BLOCK_VERTEX + `
 uniform mat4 uModelView;   // block-local (0..1) -> camera view space
 uniform vec4 uProjParams;  // x = f / aspect, y = f, z = near, w = far
+uniform float uEdgeAA;     // 1: cube mesh (silhouette edge fade)
+uniform vec2 uScreen;      // target size in pixels
+out vec2 vFaceUV;          // position on the face along its two edge axes (0..1 on the face)
+flat out vec4 vSil;        // 1 where the edge (+A, -A, +B, -B) is a silhouette edge
+flat out float vPlane;     // 1 on sprite front/back planes (alpha coverage ramp)
+flat out float vWall;      // 1 on sprite side walls (coverage across the extrusion)
+out float vExtr;           // across a side wall: 0 at its true silhouette edge, 1 where it meets the visible plane
 out vec3 vUV;
 out vec3 vTv;
 out vec3 vBv;
@@ -128,10 +147,71 @@ out vec3 vNv;
 out vec3 vPosV;
 out vec3 vTint;
 out float vAO;
+vec4 heldClip(vec3 p) {
+  vec4 v = uModelView * vec4(p, 1.0);
+  float n = uProjParams.z, f = uProjParams.w;
+  return vec4(v.x * uProjParams.x, v.y * uProjParams.y, (v.z * (f + n) + 2.0 * f * n) / (n - f), -v.z);
+}
+vec2 heldScreen(vec3 p) { vec4 c = heldClip(p); return c.xy / c.w * 0.5 * uScreen; }
+
 void main() {
   vec3 local = blockLocalPos();
-  vec4 pv = uModelView * vec4(local, 1.0);
   uint face = blockNormal();
+  vec3 A = abs(FACE_T[face]), B = abs(FACE_B[face]);
+  vec2 fuv = vec2(dot(local, A), dot(local, B));
+  vec4 sil = vec4(0.0);
+  if (uEdgeAA > 0.5) {
+    mat3 mv = mat3(uModelView);
+    // The neighbour face across each edge: silhouette if it faces away from the eye (origin).
+    vec3 dirs[4] = vec3[4](A, -A, B, -B);
+    for (int i = 0; i < 4; i++) {
+      vec3 c = (uModelView * vec4(0.5 + 0.5 * dirs[i], 1.0)).xyz;
+      if (dot(mv * dirs[i], -c) <= 0.0) sil += vec4(i == 0, i == 1, i == 2, i == 3);
+    }
+    // Push vertices on silhouette edges out by 1.5 pixels (the fade covers [-0.5, 0.5] px around
+    // the true edge). The texture coordinates stay: the face is stretched by a pixel, invisibly.
+    vec2 s0 = heldScreen(local);
+    float ea = 0.015 / max(length(heldScreen(local + A * 0.01) - s0), 1e-4);
+    float eb = 0.015 / max(length(heldScreen(local + B * 0.01) - s0), 1e-4);
+    if (fuv.x > 0.5 && sil.x > 0.5) local += A * ea;
+    if (fuv.x < 0.5 && sil.y > 0.5) local -= A * ea;
+    if (fuv.y > 0.5 && sil.z > 0.5) local += B * eb;
+    if (fuv.y < 0.5 && sil.w > 0.5) local -= B * eb;
+  }
+  // Sprite side walls run from the back plane (z = 7/16) to the front plane (z = 8/16). The edge
+  // shared with the plane that faces the eye is covered by that plane; the other one is the
+  // silhouette: only it is moved and faded. It is pushed along the wall's normal (outward, and
+  // across the wall on screen) until the wall is 2 px wide; vExtr is set so that it stays linear
+  // across the drawn wall with 0 on the true silhouette.
+  vWall = 0.0;
+  vExtr = 1.0;
+  if (uEdgeAA < 0.5 && face < 4u) {
+    vWall = 1.0;
+    vec3 cv = (uModelView * vec4(local, 1.0)).xyz;
+    float front = dot(mat3(uModelView) * vec3(0.0, 0.0, 1.0), -cv) > 0.0 ? 1.0 : -1.0;  // +1: front plane visible
+    float side = local.z < 7.5 / 16.0 ? -1.0 : 1.0;                   // this vertex: back or front edge
+    if (side == -front) {
+      vec3 L = face < 2u ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);  // along the wall
+      vec2 s0 = heldScreen(local);
+      vec2 ext = heldScreen(local - vec3(0.0, 0.0, side / 16.0)) - s0;  // to the shared edge, on screen
+      vec2 run = heldScreen(local + L * (1.0 / 16.0)) - s0;
+      vec2 perp = normalize(vec2(-run.y, run.x) + vec2(1e-6));
+      float wv = dot(ext, perp);
+      vec2 outward = wv > 0.0 ? -perp : perp;                          // away from the shared edge
+      float w = abs(wv);                                               // wall width in pixels
+      float extra = max(2.0 - w, 0.0);
+      float dp = dot(heldScreen(local + FACE_N[face] * 0.01) - s0, outward);   // px per 0.01 along the normal
+      vExtr = 0.0;
+      if (extra > 0.0 && dp > 0.05) {
+        local += FACE_N[face] * min(0.01 * extra / dp, 0.1);
+        vExtr = -min(extra / max(w, 1e-3), 1e4);
+      }
+    }
+  }
+  vSil = sil;
+  vFaceUV = vec2(dot(local, A), dot(local, B));
+  vPlane = face >= 4u ? 1.0 : 0.0;
+  vec4 pv = uModelView * vec4(local, 1.0);
   mat3 m = mat3(uModelView);
   vTv = m * FACE_T[face];
   vBv = m * FACE_B[face];
@@ -140,12 +220,17 @@ void main() {
   vTint = pow(blockTint(), vec3(2.2));
   vAO = blockAO();
   vPosV = pv.xyz;
-  float n = uProjParams.z, f = uProjParams.w;
-  gl_Position = vec4(pv.x * uProjParams.x, pv.y * uProjParams.y, (pv.z * (f + n) + 2.0 * f * n) / (n - f), -pv.z);
+  gl_Position = heldClip(local);
 }
 `;
 const HELD_FS = GLSL_COMMON + FS_DEFS + GLSL_LIGHTING + `
 uniform vec2 uHeldLight;   // x = eye sky exposure 0..1, y = block light 0..1
+uniform float uEdgeAA;
+in vec2 vFaceUV;
+flat in vec4 vSil;
+flat in float vPlane;
+flat in float vWall;
+in float vExtr;
 in vec3 vUV;
 in vec3 vTv;
 in vec3 vBv;
@@ -158,7 +243,21 @@ void main() {
   vec3 tc = vec3(pixelArtUV(vUV.xy, true), vUV.z);
   vec2 gx = dFdx(vUV.xy), gy = dFdy(vUV.xy);
   vec4 albedo = textureGrad(uAlbedo, tc, gx, gy);
-  if (albedo.a < 0.5) discard;
+  // Coverage: on sprite planes the magnified alpha crosses 0.5 over one pixel (pixelArtUV leaves
+  // a one-pixel seam), so it ramps; cube faces fade across their silhouette edges.
+  float cover = albedo.a < 0.5 ? 0.0 : 1.0;
+  if (uEdgeAA < 0.5 && vPlane > 0.5) cover = saturate((albedo.a - 0.5) / max(fwidth(albedo.a), 1e-3) + 0.5);
+  // Side wall: box filter across its silhouette edge (vExtr = 0), and at most its true width in
+  // pixels (1 / (2 hw)): a sub-pixel wall adds only the light it really covers.
+  float hw = 0.5 * length(vec2(dFdx(vExtr), dFdy(vExtr)));
+  if (vWall > 0.5) cover *= saturate((vExtr + hw) / max(2.0 * hw, 1e-4)) * saturate(0.5 / max(hw, 1e-4));
+  if (uEdgeAA > 0.5) {
+    vec2 fw = max(fwidth(vFaceUV), vec2(1e-5));
+    vec4 d = vec4(1.0 - vFaceUV.x, vFaceUV.x, 1.0 - vFaceUV.y, vFaceUV.y) / fw.xxyy;
+    vec4 c = mix(vec4(1.0), clamp(d + 0.5, 0.0, 1.0), vSil);
+    cover *= min(min(c.x, c.y), min(c.z, c.w));
+  }
+  if (cover <= 0.004) discard;
   vec4 spec = textureGrad(uSpecular, tc, gx, gy);
   vec3 base = albedo.rgb * mix(vec3(1.0), vTint, spec.a);
   vec3 nt = textureGrad(uNormals, tc, gx, gy).xyz * 2.0 - 1.0;
@@ -181,7 +280,7 @@ void main() {
   color += sunE * specularGGX(N, V, L, F0, max(rough * rough, 0.03));
   color += (envReflection(reflect(-V, N), rough) * sky + blockLightColor(blk, uCamPos.xyz) * 0.3) * envBRDF(F0, rough, max(dot(N, V), 1e-3));
   color += base * spec.b * 4.0;
-  fragColor = vec4(color, 1.0);
+  fragColor = vec4(color, cover);
 }
 `;
 
@@ -299,7 +398,10 @@ export class Overlays {
     gl.uniform3f(this.selLoc.min, block.x + b[0] - e - cam[0], block.y + b[1] - e - cam[1], block.z + b[2] - e - cam[2]);
     gl.uniform3f(this.selLoc.size, b[3] - b[0] + 2 * e, b[4] - b[1] + 2 * e, b[5] - b[2] + 2 * e);
     const rh = view.height || gl.getParameter(gl.VIEWPORT)[3] || 720;
-    gl.uniform1f(this.selLoc.width, Math.max(1.6, 2.4 * rh / 1080));
+    // Width in pixels of the image the player sees: with temporal upscaling that is the output
+    // (view.outputHeight), converted to render pixels, at least one render pixel.
+    const oh = view.outputHeight || rh;
+    gl.uniform1f(this.selLoc.width, Math.max(Math.max(1.6, 2.4 * oh / 1080) * rh / oh, 1));
     gl.uniform4f(this.selLoc.color, 0.0, 0.0, 0.0, 0.62);
     gl.enable(gl.DEPTH_TEST);
     gl.depthMask(false);
@@ -416,14 +518,22 @@ export class Overlays {
     gl.uniform4f(p.u('uProjParams'), f / aspect, f, 0.05, 10);
     const light = held.light || [1, 0];
     gl.uniform2f(p.u('uHeldLight'), light[0] ?? 1, light[1] ?? 0);
+    gl.uniform1f(p.u('uEdgeAA'), mesh.sprite ? 0 : 1);
+    let size = view.targetSize;
+    if (!size) { const vp = gl.getParameter(gl.VIEWPORT); size = [vp[2], vp[3]]; }
+    gl.uniform2f(p.u('uScreen'), size[0], size[1]);
     gl.enable(gl.DEPTH_TEST);
     gl.depthMask(true);
-    gl.disable(gl.BLEND);
+    // Edge coverage is blended over the scene; alpha (1 - self-emission, for exposure metering)
+    // becomes the coverage-weighted mix with the scene's.
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
     gl.bindVertexArray(mesh.vao);
     gl.drawElements(gl.TRIANGLES, mesh.quads * 6, gl.UNSIGNED_INT, 0);
     gl.bindVertexArray(null);
+    gl.disable(gl.BLEND);
   }
 
   dispose() {

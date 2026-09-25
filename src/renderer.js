@@ -9,13 +9,26 @@ import { TerrainRenderer } from './render/terrain.js';
 import { Overlays } from './render/overlays.js';
 import { Atmosphere } from './render/atmosphere.js';
 import { PostProcess } from './render/post.js';
-import { DEFAULT_SETTINGS } from './config.js';
+import { DEFAULT_SETTINGS, AA_MODES } from './config.js';
 
 const NEAR = 0.08;
 const LIGHT_ANGULAR_SIZE = 0.012;   // tan of the light's angular radius (PCSS penumbra)
 const MAX_DPR = 1.5;
+// RCAS strength after TAA (0..1): light at native resolution, a little more when upscaling.
+const SHARPEN_NATIVE = 0.5;
+const SHARPEN_UPSCALED = 0.8;        // at renderScale 0.5 (interpolated in between)
 
 const DEFAULTS = DEFAULT_SETTINGS;
+
+// Offset a projection matrix in NDC by (ox, oy): clip.xy += offset * clip.w, i.e. the rendered
+// image moves by (ox, oy) * size / 2 pixels. Column-major.
+function jitterProjection(m, ox, oy) {
+  for (let c = 0; c < 4; c++) {
+    m[c * 4] += ox * m[c * 4 + 3];
+    m[c * 4 + 1] += oy * m[c * 4 + 3];
+  }
+  return m;
+}
 
 // Upload the TextureSet as 2D texture arrays with every mip level.
 function createBlockArray(gl, set, levelsData, internal) {
@@ -102,9 +115,13 @@ export class Renderer {
     this.overlays = new Overlays(gl, textureSet);
 
     this.view = mat4.create();
-    this.proj = mat4.create();
+    this.proj = mat4.create();              // jittered when TAA is on (what every pass renders with)
     this.viewProj = mat4.create();
     this.invViewProj = mat4.create();
+    this.projNoJitter = mat4.create();      // the plain camera (reprojection, stats)
+    this.viewProjNoJitter = mat4.create();
+    this.jitter = [0, 0];
+    this.sharpen = [SHARPEN_NATIVE, SHARPEN_UPSCALED];   // RCAS strength after TAA: native, renderScale 0.5
     this.frustum = new Float32Array(24);
     this.viewInfo = {};             // the `view` object handed to terrain/overlays, reused every frame
     this.frameIndex = 0;
@@ -134,19 +151,25 @@ export class Renderer {
     canvas.addEventListener('webglcontextrestored', () => {
       if (typeof location !== 'undefined') location.reload();
     });
-    this.applySettings(this.settings);
+    this.applySettings(settings);
     this._defaultState();
   }
 
   // ---- settings / sizing ---------------------------------------------------------------------
 
-  applySettings(settings) {
+  applySettings(settings = {}) {
     const s = { ...DEFAULTS, ...settings };
     // Values may arrive as strings from <select> elements.
     for (const k of ['renderDistance', 'renderScale', 'shadowRes', 'shadowRadius', 'volumetrics', 'clouds', 'ssr']) {
       const v = Number(s[k]);
       s[k] = Number.isFinite(v) ? v : DEFAULTS[k];
     }
+    // Anti-aliasing: settings.aa ('taa' | 'fxaa' | 'off'). Older settings objects carry a boolean
+    // `fxaa` instead; it is honoured when there is no valid `aa`.
+    let aa = AA_MODES.includes(settings.aa) ? settings.aa : null;
+    if (!aa && typeof settings.fxaa === 'boolean') aa = settings.fxaa ? 'fxaa' : 'off';
+    s.aa = aa || (AA_MODES.includes(DEFAULTS.aa) ? DEFAULTS.aa : 'taa');
+    delete s.fxaa;   // (renderer.settings may be handed back to applySettings / a new Renderer)
     this.settings = s;
     // While the context is lost GL calls fail (framebuffers come back incomplete); restoring the
     // context reloads the page, so there is nothing to replay.
@@ -198,10 +221,17 @@ export class Renderer {
     this.height = h;
     const scale = Math.min(Math.max(Number(this.settings.renderScale) || 1, 0.25), 1);
     const rw = Math.max(1, Math.round(w * scale)), rh = Math.max(1, Math.round(h * scale));
-    if (rw !== this.renderWidth || rh !== this.renderHeight || !this.sceneFB) this._createSceneTargets(rw, rh);
+    // TAA with float targets: the scene pass also writes motion vectors (waving plants/leaves) and
+    // a reactive flag (particles) into a second attachment for the resolve.
+    const motion = this.settings.aa === 'taa' && this.hdr.type !== this.gl.UNSIGNED_BYTE;
+    if (rw !== this.renderWidth || rh !== this.renderHeight || !this.sceneFB || !!this.motionTex !== motion) this._createSceneTargets(rw, rh, motion);
+    // Post targets: render-size ones follow the scene; with TAA the history and everything after
+    // the resolve are canvas-sized (a canvas size change restarts the history, a renderScale
+    // change keeps it).
+    this.post.resize(rw, rh, w, h, this.settings.aa === 'taa');
   }
 
-  _createSceneTargets(w, h) {
+  _createSceneTargets(w, h, motion = false) {
     const gl = this.gl;
     this._deleteSceneTargets();
     this.renderWidth = w;
@@ -209,19 +239,20 @@ export class Renderer {
     const color = () => createTexture2D(gl, w, h, { ...this.hdr, filter: gl.LINEAR });
     this.sceneColor = color();
     this.sceneDepth = createDepthTexture(gl, w, h);
-    this.sceneFB = createFramebuffer(gl, [this.sceneColor], this.sceneDepth);
+    // Attachment 1 (TAA only): xy = NDC motion beyond the static-world reprojection, z = reactive.
+    this.motionTex = motion ? createTexture2D(gl, w, h, { ...this.hdr, filter: gl.NEAREST }) : null;
+    this.sceneFB = createFramebuffer(gl, motion ? [this.sceneColor, this.motionTex] : [this.sceneColor], this.sceneDepth);
     this.copyColor = color();
     this.copyDepth = createDepthTexture(gl, w, h);
     this.copyFB = createFramebuffer(gl, [this.copyColor], this.copyDepth);
     gl.bindTexture(gl.TEXTURE_2D, null);
-    this.post.resize(w, h);
   }
 
   _deleteSceneTargets() {
     const gl = this.gl;
-    for (const t of [this.sceneColor, this.sceneDepth, this.copyColor, this.copyDepth]) if (t) gl.deleteTexture(t);
+    for (const t of [this.sceneColor, this.sceneDepth, this.motionTex, this.copyColor, this.copyDepth]) if (t) gl.deleteTexture(t);
     for (const f of [this.sceneFB, this.copyFB]) if (f) gl.deleteFramebuffer(f);
-    this.sceneColor = this.sceneDepth = this.copyColor = this.copyDepth = this.sceneFB = this.copyFB = null;
+    this.sceneColor = this.sceneDepth = this.motionTex = this.copyColor = this.copyDepth = this.sceneFB = this.copyFB = null;
   }
 
   // ---- helpers -------------------------------------------------------------------------------
@@ -239,6 +270,14 @@ export class Renderer {
     gl.colorMask(true, true, true, true);
     gl.disable(gl.POLYGON_OFFSET_FILL);
     gl.disable(gl.SCISSOR_TEST);
+  }
+
+  // Scene FBO draw buffers: with the motion attachment, passes that write motion vectors (terrain,
+  // particles, water) draw into both; the others (sky, selection outline) leave it untouched.
+  _sceneBuffers(withMotion) {
+    if (!this.motionTex) return;
+    const gl = this.gl;
+    gl.drawBuffers(withMotion ? [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1] : [gl.COLOR_ATTACHMENT0, gl.NONE]);
   }
 
   _bindShadow(tex) {
@@ -338,17 +377,30 @@ export class Renderer {
     const cloudCoverage = Number.isFinite(frame.cloudCoverage) ? frame.cloudCoverage : 0.45;
     const underwater = !!frame.underwater;
 
+    const sky = this.atmosphere.prepare(frame);
+    const post = this.post;
+
     // Camera: rotation-only view (camera-relative rendering), perspective with the far plane past the fog end.
     const fwd = forwardFromYawPitch(frame.yaw || 0, frame.pitch || 0);
     mat4.lookAt(this.view, [0, 0, 0], fwd, [0, 1, 0]);
     const far = s.renderDistance * 16 * 1.6 + 64;
     const fov = frame.fov || (75 * Math.PI) / 180;
-    mat4.perspective(this.proj, fov, W / H, NEAR, far);
+    mat4.perspective(this.projNoJitter, fov, W / H, NEAR, far);
+    mat4.multiply(this.viewProjNoJitter, this.projNoJitter, this.view);
+    // TAA: a sub-pixel Halton jitter on the projection every geometry pass and every full-screen
+    // pass that rebuilds view rays uses (through the Frame block), never on the shadow pass.
+    const taaOn = s.aa === 'taa' && post.temporal;
+    const taa = taaOn ? post.taa.begin({
+      camPos, fwd, sunDir: sky.sunDir, viewProj: this.viewProjNoJitter, scale: W / Math.max(this.width, 1),
+    }) : null;
+    this.jitter[0] = taa ? taa.jitter[0] : 0;
+    this.jitter[1] = taa ? taa.jitter[1] : 0;
+    this.proj.set(this.projNoJitter);
+    if (taa) jitterProjection(this.proj, (2 * this.jitter[0]) / W, (2 * this.jitter[1]) / H);
     mat4.multiply(this.viewProj, this.proj, this.view);
     mat4.invert(this.invViewProj, this.viewProj);
     frustumPlanes(this.frustum, this.viewProj);
 
-    const sky = this.atmosphere.prepare(frame);
     const shadowsOn = !!(s.shadows && this.shadowTex);
     const shadow = computeShadowMatrix(camPos, sky.lightDir, s.shadowRadius);
 
@@ -358,6 +410,16 @@ export class Renderer {
     U.mat('uViewProj', this.viewProj);
     U.mat('uInvViewProj', this.invViewProj);
     U.mat('uShadowMat', shadow.matrix);
+    U.mat('uPrevViewProj', taa ? taa.prevViewProj : this.viewProjNoJitter);
+    U.vec('uTAA', this.jitter[0], this.jitter[1], taa ? 1 : 0, taa && taa.valid ? 1 : 0);
+    if (taa) U.vec('uCamDelta', taa.camDelta[0], taa.camDelta[1], taa.camDelta[2], 0);
+    else U.vec('uCamDelta', 0, 0, 0, 0);
+    // Footprint scale (TAAU mip bias), previous frame's animation time (waving motion vectors),
+    // motion vectors on/off.
+    const motionOn = !!(taa && this.motionTex);
+    const prevTime = taa && taa.valid && Number.isFinite(this._prevTime) ? this._prevTime : time;
+    U.vec('uTAAInfo', taa ? W / Math.max(this.width, 1) : 1, prevTime, motionOn ? 1 : 0, 0);
+    this._prevTime = time;
     U.vec('uCamPos', camPos[0], camPos[1], camPos[2], time);
     U.vec('uSunDir', sky.sunDir[0], sky.sunDir[1], sky.sunDir[2], sky.sunVisibility);
     U.vec('uMoonDir', sky.moonDir[0], sky.moonDir[1], sky.moonDir[2], sky.moonVisibility);
@@ -391,12 +453,18 @@ export class Renderer {
     view.aspect = W / H;
     view.width = W;
     view.height = H;
+    // Size of the image the player sees (the TAA output; without TAA the render image is upscaled).
+    view.outputWidth = taa ? this.width : W;
+    view.outputHeight = taa ? this.height : H;
     view.near = NEAR;
     view.far = far;
     view.view = this.view;
     view.proj = this.proj;
     view.viewProj = this.viewProj;
     view.invViewProj = this.invViewProj;
+    view.projNoJitter = this.projNoJitter;
+    view.viewProjNoJitter = this.viewProjNoJitter;
+    view.jitter = this.jitter;
     view.underwater = underwater;
     view.eyeSkyLight = eyeSkyLight;
     view.frameIndex = this.frameIndex;
@@ -432,10 +500,12 @@ export class Renderer {
     // 3. Opaque scene, particles, then the sky on the far plane.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFB);
     gl.viewport(0, 0, W, H);
+    this._sceneBuffers(true);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     this._terrainCall('drawOpaque', view, st);
     if (frame.particles && this.overlays.drawParticles) this._run('drawParticles', () => this.overlays.drawParticles(view, frame.particles));
+    this._sceneBuffers(false);
     this.atmosphere.drawSky();
     this._defaultState();
 
@@ -454,14 +524,15 @@ export class Renderer {
       gl.bindTexture(gl.TEXTURE_2D, this.copyColor);
       gl.activeTexture(gl.TEXTURE0 + UNIT.PASS0 + 1);
       gl.bindTexture(gl.TEXTURE_2D, this.copyDepth);
+      this._sceneBuffers(true);
       this._terrainCall('drawWater', view, st);
     }
     if (frame.selection && this.overlays.drawSelection) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneFB);
       gl.viewport(0, 0, W, H);
+      this._sceneBuffers(false);
       this._run('drawSelection', () => this.overlays.drawSelection(view, frame.selection));
     }
-    const post = this.post;
     post.passes = 0;
 
     // 5. Half-res volumetric light + clouds.
@@ -471,20 +542,30 @@ export class Renderer {
       volStrength: this.volumetricStrength,
     });
 
-    // 6. Composite into the HDR target, then the held item on top (own cleared depth).
+    // 6. Composite (render size), then with TAA the resolve into the output-size HDR target, then
+    // the held item on top of whichever HDR target the post chain reads (own cleared depth; after
+    // the resolve it is neither jittered nor part of the history).
     post.composite(this.sceneColor, this.sceneDepth, { halfOn, flatClouds: !(s.clouds > 0) && cloudCoverage > 0 });
-    if (frame.held && this.overlays.drawHeld) {
+    if (taa) post.resolve(this.sceneDepth, motionOn ? this.motionTex : null);
+    const held = !!(frame.held && this.overlays.drawHeld);
+    if (held) {
       post.beginHeld();
+      view.aspect = post.postWidth / post.postHeight;
+      view.targetSize = view.targetSize || [0, 0];
+      view.targetSize[0] = post.postWidth;
+      view.targetSize[1] = post.postHeight;
       this._run('drawHeld', () => this.overlays.drawHeld(view, frame.held));
     }
 
     // 7-10. Bloom downsample, exposure (meters a plain downsampled level + the scene depth),
-    // bloom upsample, tone map, FXAA to the canvas.
+    // bloom upsample, tone map, final pass to the canvas (TAA sharpen, FXAA or copy).
     post.downsample(!!s.bloom);
     post.exposureUpdate(frame.dt || 1 / 60, this.sceneDepth);
     if (s.bloom) post.upsample();
     const bloomStrength = s.bloom ? 0.05 + 0.035 * sky.night : 0;
-    post.finish(this.width, this.height, { fxaa: !!s.fxaa, bloomStrength });
+    const upscale = Math.min(Math.max((1 - W / Math.max(this.width, 1)) / 0.5, 0), 1);
+    const sharpness = this.sharpen[0] + (this.sharpen[1] - this.sharpen[0]) * upscale;
+    post.finish(this.width, this.height, { aa: s.aa, bloomStrength, sharpness, held });
 
     // Leave no pass inputs bound (avoids accidental feedback loops next frame).
     for (let u = UNIT.PASS0; u < UNIT.PASS0 + 6; u++) {
@@ -507,6 +588,8 @@ export class Renderer {
     S.height = this.height;
     S.renderWidth = W;
     S.renderHeight = H;
+    S.aa = taa ? 'taa' : s.aa === 'fxaa' ? 'fxaa' : 'off';
+    S.taaCuts = post.taa.cuts;
   }
 
   dispose() {
