@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- Review scratch (performance), read-only: times the synchronous boot steps main.js runs before the first frame. -->
+<html><body style="margin:0"><canvas id="c" style="width:1280px;height:720px"></canvas>
+<script type="module">
+const T = {};
+const t = async (name, f) => { const a = performance.now(); const r = await f(); T[name] = +(performance.now() - a).toFixed(1); return r; };
+const { buildTextures } = await import('/src/textures.js');
+const { Renderer } = await import('/src/renderer.js');
+const { loadSettings } = await import('/src/config.js');
+const { generateNoise2D, generateNoise3D } = await import('/src/render/atmosphere.js');
+const { createQuadIndices } = await import('/src/vertex.js');
+const tex = await t('buildTextures', () => buildTextures());
+await t('noise2D (inside Renderer)', () => generateNoise2D(256));
+await t('noise3D (inside Renderer)', () => generateNoise3D(64));
+await t('quad index buffer 196608 quads (inside TerrainRenderer)', () => createQuadIndices(196608));
+const canvas = document.getElementById('c');
+const R = await t('new Renderer total', () => new Renderer(canvas, tex, loadSettings()));
+const gl = R.gl;
+T.parallelCompileExt = !!gl.getExtension('KHR_parallel_shader_compile');
+window.__T = T;
+</script></body></html>

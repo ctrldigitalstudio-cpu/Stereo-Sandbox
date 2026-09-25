@@ -35,14 +35,8 @@ export const FRAME_OFFSETS = {
   uEnv: 108,         // vec4 x = camera underwater 0/1, y = frame index, z = cloud coverage 0..1, w = time of day 0..1
   uWind: 112,        // vec4 xy = cloud wind velocity (blocks/s), z = star-field rotation (radians), w = fog density multiplier
   uQuality: 116,     // vec4 x = SSR steps (0 = off), y = volumetric steps (0 = off), z = cloud steps (0 = off), w = PCSS 0/1
-  // Temporal anti-aliasing. With TAA on, uProj / uViewProj / uInvViewProj above carry this frame's
-  // sub-pixel jitter (so every pass that rasterises or reconstructs view rays is jittered alike);
-  // the matrices below never are.
-  uPrevViewProj: 120, // mat4 previous frame's UNJITTERED view-projection (camera-relative to the previous camera)
-  uTAA: 136,         // vec4 xy = jitter in render pixels (the image moves by +xy), z = TAA on 0/1, w = history valid 0/1
-  uCamDelta: 140,    // vec4 xyz = camPos - prevCamPos (blocks, computed in doubles), w = 0
 };
-export const FRAME_FLOATS = 144;
+export const FRAME_FLOATS = 120;
 
 export class FrameUniforms {
   constructor(gl) {
@@ -115,9 +109,6 @@ layout(std140) uniform Frame {
   vec4 uEnv;
   vec4 uWind;
   vec4 uQuality;
-  mat4 uPrevViewProj;
-  vec4 uTAA;
-  vec4 uCamDelta;
 };
 `;
 
@@ -150,10 +141,6 @@ float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 // Interleaved gradient noise, animated per frame (for dithering ray marches)
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 float ignFrame(vec2 p) { return ign(p + 5.588238 * mod(uEnv.y, 64.0)); }
-// Temporal anti-aliasing accumulates over frames: dither patterns may then change every frame
-// (the resolve averages them away); without it a moving pattern would only crawl.
-bool taaOn() { return uTAA.z > 0.5; }
-float ignTemporal(vec2 p) { return taaOn() ? ignFrame(p) : ign(p); }
 
 // ---- Pixel-art texturing -----------------------------------------------------------------
 // Block textures use LINEAR magnification + anisotropic minification. D3D11 (Chrome on Windows)

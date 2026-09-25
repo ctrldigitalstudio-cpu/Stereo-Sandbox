@@ -1,19 +1,12 @@
 // Post-processing chain: half-res volumetric light + volumetric clouds, composite into the HDR
-// target, the temporal anti-aliasing resolve (taa.js), bloom, auto exposure, tone mapping and the
-// final pass to the canvas (TAA sharpening, FXAA or a copy). Every pass leaves the GL state clean
-// (depth test on, depth write on, blend off, back-face culling) and sets its own viewport.
-//
-// Sizes: the half-res buffers and the composite follow the render size (canvas x renderScale).
-// With TAA the resolve reconstructs at the output (canvas) size and everything after it (held
-// item, bloom, exposure, tone map, final pass) runs at that size; without TAA they run at the
-// render size and the final pass upscales.
+// target, bloom, auto exposure, tone mapping and FXAA to the canvas. Every pass leaves the GL
+// state clean (depth test on, depth write on, blend off, back-face culling) and sets its own viewport.
 
 import { Program, createTexture2D, createFramebuffer, createDepthRenderbuffer, drawFullscreen, UNIT } from '../gl.js';
 import { GLSL_COMMON, FULLSCREEN_VS } from './common.js';
-import { TemporalAA } from './taa.js';
 
 export const BLOOM_LEVELS = 6;
-const METER_LEVEL = 4;          // bloom level the exposure meters (1/32 of the size the post chain runs at)
+const METER_LEVEL = 4;          // bloom level the exposure meters (1/32 of the render size)
 const P0 = UNIT.PASS0;
 
 // ---------------------------------------------------------------------------------------------
@@ -131,8 +124,7 @@ vec4 volumetricClouds(vec3 dir, float sceneDist) {
   if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
 
   float stepLen = (t1 - t0) / float(n);
-  // Static dither without TAA (a moving one would crawl); per frame with it (accumulated away).
-  float jit = ignTemporal(gl_FragCoord.xy + 0.37);
+  float jit = ign(gl_FragCoord.xy + 0.37);
   vec3 L = uLightDir.xyz;
   float mu = dot(dir, L);
   // Dual-lobe phase: a strong forward lobe for silver linings plus some back scatter.
@@ -194,16 +186,13 @@ void main() {
 }
 `;
 
-// 3x3 depth-aware filter of the half-res buffers: IGN spreads its dither values evenly over
-// every 3x3 neighbourhood, so a box turns the per-pixel ray-march jitter into smooth gradients.
-// With TAA the dither changes every frame and the resolve averages it over time, so a lighter
-// kernel (neighbours weighted uSpread, corners uSpread^2) keeps the shafts and cloud edges sharper.
+// 3x3 depth-aware box filter of the half-res buffers: IGN spreads its dither values evenly over
+// every 3x3 neighbourhood, so this turns the per-pixel ray-march jitter into smooth gradients.
 const DENOISE_FS = GLSL_COMMON + `
 layout(location = 0) out vec4 oVol;
 layout(location = 1) out vec4 oCloud;
 uniform sampler2D uVol;      // unit 10
 uniform sampler2D uCloud;    // unit 11
-uniform float uSpread;       // 1 = 3x3 box, smaller = more weight on the centre texel
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 hmax = textureSize(uVol, 0) - 1;
@@ -215,7 +204,7 @@ void main() {
     for (int x = -1; x <= 1; x++) {
       ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hmax);
       vec4 v = texelFetch(uVol, q, 0);
-      float w = exp(-abs(v.a - z0) / max(z0, 1e-4) * 30.0) * (x == 0 ? 1.0 : uSpread) * (y == 0 ? 1.0 : uSpread);
+      float w = exp(-abs(v.a - z0) / max(z0, 1e-4) * 30.0);
       vs += v.rgb * w;
       cs += texelFetch(uCloud, q, 0) * w;
       ws += w;
@@ -491,7 +480,6 @@ uniform sampler2D uExposure;  // unit 12
 uniform float uBloomStrength;
 uniform float uSaturation;
 uniform float uVignette;
-uniform float uDither;        // 1: +-1 LSB dither here (8-bit target); 0: the final pass dithers
 
 // Stephen Hill's ACES fit (sRGB -> AP1-ish -> RRT+ODT -> sRGB)
 const mat3 ACES_IN = mat3(0.59719, 0.07600, 0.02840, 0.35458, 0.90834, 0.13383, 0.04823, 0.01566, 0.83777);
@@ -535,7 +523,7 @@ void main() {
   s *= 1.0 - uVignette * dot(d, d) * 1.6;
   // Triangular dither of +-1 LSB hides banding in the sky gradients.
   float r = hash12(gl_FragCoord.xy + fract(uCamPos.w) * 61.0) + hash12(gl_FragCoord.yx * 1.37 + 17.0) - 1.0;
-  s += r / 255.0 * uDither;
+  s += r / 255.0;
   o = vec4(s, dot(s, vec3(0.299, 0.587, 0.114)));
 }
 `;
@@ -650,50 +638,6 @@ void main() {
 }
 `;
 
-// Final pass after TAA: robust contrast-adaptive sharpening (AMD FidelityFX FSR1 RCAS) on the
-// tone-mapped, sRGB-encoded image (perceptual space, as RCAS expects) to give the pixel-art texels
-// back the crispness the temporal filter takes, then the +-1 LSB dither. The lobe is limited so
-// the result never leaves the min/max of the 4 neighbours (no ringing) and is reduced where the
-// centre looks like noise.
-const SHARPEN_FS = GLSL_COMMON + `
-out vec4 o;
-uniform sampler2D uTex;       // unit 10 (same size as the target)
-uniform float uSharpness;     // 0 = off .. 1 = RCAS maximum
-uniform float uDither;
-float hash12(vec2 p) {
-  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-  p3 += dot(p3, p3.yzx + 33.33);
-  return fract((p3.x + p3.y) * p3.z);
-}
-void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy);
-  ivec2 m = textureSize(uTex, 0) - 1;
-  vec3 b = texelFetch(uTex, clamp(p + ivec2(0, 1), ivec2(0), m), 0).rgb;
-  vec3 d = texelFetch(uTex, clamp(p + ivec2(-1, 0), ivec2(0), m), 0).rgb;
-  vec3 e = texelFetch(uTex, p, 0).rgb;
-  vec3 f = texelFetch(uTex, clamp(p + ivec2(1, 0), ivec2(0), m), 0).rgb;
-  vec3 h = texelFetch(uTex, clamp(p + ivec2(0, -1), ivec2(0), m), 0).rgb;
-  vec3 c = e;
-  if (uSharpness > 0.0) {
-    vec3 mn = min(min(b, d), min(f, h)), mx = max(max(b, d), max(f, h));
-    vec3 hitMin = min(mn, e) / (4.0 * mx + 1e-5);
-    vec3 hitMax = (1.0 - max(mx, e)) / (4.0 * min(mn, e) - 4.0 - 1e-5);
-    vec3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * uSharpness;
-    // Noise detection on luma: an isolated centre (dither, sparkle) is sharpened less.
-    float bL = b.g + 0.5 * (b.r + b.b), dL = d.g + 0.5 * (d.r + d.b), eL = e.g + 0.5 * (e.r + e.b);
-    float fL = f.g + 0.5 * (f.r + f.b), hL = h.g + 0.5 * (h.r + h.b);
-    float nz = 0.25 * (bL + dL + fL + hL) - eL;
-    float range = max(max(max(bL, dL), max(fL, hL)), eL) - min(min(min(bL, dL), min(fL, hL)), eL);
-    nz = saturate(abs(nz) / max(range, 1e-5));
-    lobe *= 1.0 - 0.5 * nz;
-    c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
-  }
-  float r = hash12(gl_FragCoord.xy + fract(uCamPos.w) * 61.0) + hash12(gl_FragCoord.yx * 1.37 + 17.0) - 1.0;
-  o = vec4(saturate(c) + r / 255.0 * uDither, 1.0);
-}
-`;
-
 const COPY_FS = GLSL_COMMON + `
 in vec2 vUV;
 out vec4 o;
@@ -711,9 +655,6 @@ export class PostProcess {
     this.gl = gl;
     this.hdr = hdrFormat;
     this.ldr = { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE };
-    // Float targets: the tone-mapped image before the TAA sharpen pass can stay unquantised (the
-    // sharpen pass dithers once, at the end); otherwise the tone map dithers into 8 bits.
-    this.floatTargets = hdrFormat.type !== gl.UNSIGNED_BYTE;
     const mk = (fs, label, samplers) => {
       const p = new Program(gl, FULLSCREEN_VS, fs, label);
       p.samplers(samplers);
@@ -727,10 +668,8 @@ export class PostProcess {
     this.exposureProgram = mk(EXPOSURE_FS, 'exposure', { uMeter: P0, uPrev: P0 + 1, uDepth: P0 + 2 });
     this.tonemapProgram = mk(TONEMAP_FS, 'tonemap', { uHDR: P0, uBloom: P0 + 1, uExposure: P0 + 2 });
     this.fxaaProgram = mk(FXAA_FS, 'fxaa', { uTex: P0 });
-    this.sharpenProgram = mk(SHARPEN_FS, 'sharpen', { uTex: P0 });
     this.copyProgram = mk(COPY_FS, 'copy', { uTex: P0 });
     gl.useProgram(null);
-    this.taa = new TemporalAA(gl, hdrFormat);
 
     // Exposure ping-pong (1x1, never resized)
     this.exposure = [0, 1].map(() => {
@@ -740,85 +679,50 @@ export class PostProcess {
     this.exposureIndex = 0;
     this.resetExposure = true;
     this.passes = 0;
-    this.width = 0;          // render size (half-res buffers, composite)
+    this.width = 0;
     this.height = 0;
-    this.postWidth = 0;      // size of everything after the composite / TAA resolve
-    this.postHeight = 0;
-    this.temporal = false;   // TAA: resolve to the output size
-    // Denoise kernel of the half-res buffers (see DENOISE_FS): box without TAA, lighter with it.
-    this.denoiseSpread = 1;
-    this.denoiseSpreadTAA = 0.35;
   }
 
   _deleteTargets() {
-    this._deleteRenderTargets();
-    this._deletePostTargets();
-  }
-
-  _deleteRenderTargets() {
     const gl = this.gl;
     if (!this.targets) return;
     const t = this.targets;
-    for (const tex of [t.volTex, t.cloudTex, t.volTex2, t.cloudTex2, t.compTex]) gl.deleteTexture(tex);
-    for (const fb of [t.halfFB, t.halfFB2, t.compFB]) gl.deleteFramebuffer(fb);
-    gl.deleteRenderbuffer(t.compDepth);
+    for (const tex of [t.volTex, t.cloudTex, t.volTex2, t.cloudTex2, t.hdrTex, t.ldrTex, ...t.bloom.map((b) => b.tex)]) gl.deleteTexture(tex);
+    for (const fb of [t.halfFB, t.halfFB2, t.hdrFB, t.ldrFB, ...t.bloom.map((b) => b.fb)]) gl.deleteFramebuffer(fb);
+    gl.deleteRenderbuffer(t.hdrDepth);
     this.targets = null;
   }
 
-  _deletePostTargets() {
+  // (Re)create every size-dependent target for a render size of w x h.
+  resize(w, h) {
+    if (w === this.width && h === this.height && this.targets) return;
     const gl = this.gl;
-    if (!this.postTargets) return;
-    const t = this.postTargets;
-    for (const tex of [t.ldrTex, ...t.bloom.map((b) => b.tex)]) gl.deleteTexture(tex);
-    for (const fb of [t.ldrFB, ...t.bloom.map((b) => b.fb)]) gl.deleteFramebuffer(fb);
-    this.postTargets = null;
-  }
-
-  // (Re)create the size-dependent targets: render size w x h, output size outW x outH (the canvas).
-  // temporal: TAA on (resolve + everything after it at the output size). Only what changed is
-  // rebuilt, so a renderScale change keeps the (output-sized) TAA history.
-  resize(w, h, outW = w, outH = h, temporal = false) {
-    const gl = this.gl;
-    if (w !== this.width || h !== this.height || !this.targets) {
-      this._deleteRenderTargets();
-      this.width = w;
-      this.height = h;
-      const hw = Math.max(1, (w + 1) >> 1), hh = Math.max(1, (h + 1) >> 1);
-      const volTex = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
-      const cloudTex = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
-      const halfFB = createFramebuffer(gl, [volTex, cloudTex]);
-      const volTex2 = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
-      const cloudTex2 = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
-      const halfFB2 = createFramebuffer(gl, [volTex2, cloudTex2]);
-      const compTex = colorTarget(gl, w, h, this.hdr, gl.LINEAR);
-      const compDepth = createDepthRenderbuffer(gl, w, h);
-      const compFB = createFramebuffer(gl, [compTex], compDepth, true);
-      this.targets = { volTex, cloudTex, halfFB, volTex2, cloudTex2, halfFB2, halfW: hw, halfH: hh, compTex, compDepth, compFB };
+    this._deleteTargets();
+    this.width = w;
+    this.height = h;
+    const hw = Math.max(1, (w + 1) >> 1), hh = Math.max(1, (h + 1) >> 1);
+    const volTex = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
+    const cloudTex = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
+    const halfFB = createFramebuffer(gl, [volTex, cloudTex]);
+    const volTex2 = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
+    const cloudTex2 = colorTarget(gl, hw, hh, this.hdr, gl.NEAREST);
+    const halfFB2 = createFramebuffer(gl, [volTex2, cloudTex2]);
+    const hdrTex = colorTarget(gl, w, h, this.hdr, gl.LINEAR);
+    const hdrDepth = createDepthRenderbuffer(gl, w, h);
+    const hdrFB = createFramebuffer(gl, [hdrTex], hdrDepth, true);
+    const ldrTex = colorTarget(gl, w, h, this.ldr, gl.LINEAR);
+    const ldrFB = createFramebuffer(gl, [ldrTex]);
+    const bloom = [];
+    let bw = w, bh = h;
+    for (let i = 0; i < BLOOM_LEVELS; i++) {
+      bw = Math.max(1, (bw + 1) >> 1);
+      bh = Math.max(1, (bh + 1) >> 1);
+      const tex = colorTarget(gl, bw, bh, this.hdr, gl.LINEAR);
+      bloom.push({ tex, fb: createFramebuffer(gl, [tex]), w: bw, h: bh });
     }
-    const pw = temporal ? outW : w, ph = temporal ? outH : h;
-    const ldrFloat = temporal && this.floatTargets;
-    const pt = this.postTargets;
-    if (!pt || pt.w !== pw || pt.h !== ph || pt.ldrFloat !== ldrFloat) {
-      this._deletePostTargets();
-      const ldrTex = colorTarget(gl, pw, ph, ldrFloat ? this.hdr : this.ldr, gl.LINEAR);
-      const ldrFB = createFramebuffer(gl, [ldrTex]);
-      const bloom = [];
-      let bw = pw, bh = ph;
-      for (let i = 0; i < BLOOM_LEVELS; i++) {
-        bw = Math.max(1, (bw + 1) >> 1);
-        bh = Math.max(1, (bh + 1) >> 1);
-        const tex = colorTarget(gl, bw, bh, this.hdr, gl.LINEAR);
-        bloom.push({ tex, fb: createFramebuffer(gl, [tex]), w: bw, h: bh });
-      }
-      this.postTargets = { w: pw, h: ph, ldrFloat, ldrTex, ldrFB, bloom };
-    }
-    this.postWidth = pw;
-    this.postHeight = ph;
-    if (temporal) this.taa.resize(outW, outH);
-    else if (this.taa.targets) this.taa.release();
-    this.temporal = temporal;
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    this.targets = { volTex, cloudTex, halfFB, volTex2, cloudTex2, halfFB2, halfW: hw, halfH: hh, hdrTex, hdrDepth, hdrFB, ldrTex, ldrFB, bloom };
   }
 
   _begin(fb, w, h) {
@@ -858,18 +762,17 @@ export class PostProcess {
     this._begin(t.halfFB2, t.halfW, t.halfH);
     this._bind(P0, t.volTex);
     this._bind(P0 + 1, t.cloudTex);
-    const d = this.denoiseProgram.use();
-    gl.uniform1f(d.u('uSpread'), this.temporal ? this.denoiseSpreadTAA : this.denoiseSpread);
+    this.denoiseProgram.use();
     drawFullscreen(gl);
     this._end();
     return true;
   }
 
-  // Scene + volumetrics + clouds -> the composite target (render size).
+  // Scene + volumetrics + clouds -> HDR target. Leaves the HDR target bound (for the held item).
   composite(sceneColor, sceneDepth, { halfOn, flatClouds }) {
     const gl = this.gl;
     const t = this.targets;
-    this._begin(t.compFB, this.width, this.height);
+    this._begin(t.hdrFB, this.width, this.height);
     this._bind(P0, sceneColor);
     this._bind(P0 + 1, sceneDepth);
     this._bind(P0 + 2, t.volTex2);
@@ -882,22 +785,10 @@ export class PostProcess {
     this._end();
   }
 
-  // TAA resolve of the composite into the output-size HDR target (no-op without TAA).
-  resolve(sceneDepth) {
-    if (!this.temporal) return false;
-    this.passes++;
-    return this.taa.resolve(this.targets.compTex, sceneDepth, this.exposureTexture, this.width / this.postWidth);
-  }
-
-  // The HDR image the bloom / exposure / tone map read: the TAA output, or the composite.
-  get source() { return this.temporal ? this.taa.outputTexture : this.targets.compTex; }
-
-  // Bind the HDR target the held item goes into (after the TAA resolve: never jittered, never in
-  // the history), with its own depth cleared.
+  // Bind the HDR target with its depth cleared, ready for the held item.
   beginHeld() {
     const gl = this.gl;
-    if (this.temporal) { this.taa.beginHeld(); return; }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.targets.compFB);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.targets.hdrFB);
     gl.viewport(0, 0, this.width, this.height);
     gl.depthMask(true);
     gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -907,10 +798,11 @@ export class PostProcess {
   // without bloom the chain stops at the metering level.
   downsample(enabled) {
     const gl = this.gl;
-    const levels = this.postTargets.bloom;
+    const t = this.targets;
+    const levels = t.bloom;
     const n = enabled ? levels.length : METER_LEVEL + 1;
     const down = this.downProgram.use();
-    let srcTex = this.source, sw = this.postWidth, sh = this.postHeight;
+    let srcTex = t.hdrTex, sw = this.width, sh = this.height;
     for (let i = 0; i < n; i++) {
       const L = levels[i];
       this._begin(L.fb, L.w, L.h);
@@ -927,7 +819,7 @@ export class PostProcess {
   // Tent upsample back up the chain (additive), after exposure has metered the plain levels.
   upsample() {
     const gl = this.gl;
-    const levels = this.postTargets.bloom;
+    const levels = this.targets.bloom;
     const up = this.upProgram.use();
     for (let i = levels.length - 2; i >= 0; i--) {
       const L = levels[i], S = levels[i + 1];
@@ -952,7 +844,7 @@ export class PostProcess {
     const prev = this.exposure[this.exposureIndex];
     const next = this.exposure[1 - this.exposureIndex];
     this._begin(next.fb, 1, 1);
-    this._bind(P0, this.postTargets.bloom[METER_LEVEL].tex);
+    this._bind(P0, this.targets.bloom[METER_LEVEL].tex);
     this._bind(P0 + 1, prev.tex);
     this._bind(P0 + 2, sceneDepth);
     const p = this.exposureProgram.use();
@@ -966,43 +858,26 @@ export class PostProcess {
 
   get exposureTexture() { return this.exposure[this.exposureIndex].tex; }
 
-  // Tone map, then the final pass to the canvas at canvasW x canvasH: with TAA a light RCAS
-  // sharpen (same size), else FXAA or a straight copy (upscaling from the render size).
-  // aa: 'taa' | 'fxaa' | 'off'; sharpness 0..1 (TAA only).
-  finish(canvasW, canvasH, { aa = 'off', fxaa, bloomStrength, saturation = 1.1, vignette = 0.22, sharpness = 0.5 }) {
+  // Tone map, then FXAA (or a straight copy) to the canvas at canvasW x canvasH.
+  finish(canvasW, canvasH, { fxaa, bloomStrength, saturation = 1.1, vignette = 0.22 }) {
     const gl = this.gl;
-    const t = this.postTargets;
-    if (fxaa !== undefined && aa === 'off') aa = fxaa ? 'fxaa' : 'off';   // legacy option
-    const temporal = this.temporal;
-    const mode = temporal ? 'taa' : aa === 'fxaa' ? 'fxaa' : 'off';
-    const pw = this.postWidth, ph = this.postHeight;
-    const direct = mode === 'off' && canvasW === pw && canvasH === ph;
-    // The tone map dithers into 8 bits, unless the sharpen pass follows on a float target.
-    const ditherLater = mode === 'taa' && t.ldrFloat;
+    const t = this.targets;
+    const direct = !fxaa && canvasW === this.width && canvasH === this.height;
     if (direct) this._begin(null, canvasW, canvasH);
-    else this._begin(t.ldrFB, pw, ph);
-    this._bind(P0, this.source);
+    else this._begin(t.ldrFB, this.width, this.height);
+    this._bind(P0, t.hdrTex);
     this._bind(P0 + 1, t.bloom[0].tex);
     this._bind(P0 + 2, this.exposureTexture);
     const p = this.tonemapProgram.use();
     gl.uniform1f(p.u('uBloomStrength'), bloomStrength);
     gl.uniform1f(p.u('uSaturation'), saturation);
     gl.uniform1f(p.u('uVignette'), vignette);
-    gl.uniform1f(p.u('uDither'), ditherLater ? 0 : 1);
     drawFullscreen(gl);
     if (!direct) {
       this._begin(null, canvasW, canvasH);
       this._bind(P0, t.ldrTex);
-      if (mode === 'taa' && canvasW === pw && canvasH === ph) {
-        const q = this.sharpenProgram.use();
-        gl.uniform1f(q.u('uSharpness'), sharpness);
-        gl.uniform1f(q.u('uDither'), ditherLater ? 1 : 0);
-      } else if (mode === 'fxaa') {
-        const q = this.fxaaProgram.use();
-        gl.uniform2f(q.u('uRcp'), 1 / pw, 1 / ph);
-      } else {
-        this.copyProgram.use();
-      }
+      const q = fxaa ? this.fxaaProgram.use() : this.copyProgram.use();
+      if (fxaa) gl.uniform2f(q.u('uRcp'), 1 / this.width, 1 / this.height);
       drawFullscreen(gl);
     }
     this._end();
@@ -1011,9 +886,6 @@ export class PostProcess {
   dispose() {
     const gl = this.gl;
     this._deleteTargets();
-    this.taa.dispose();
     for (const e of this.exposure) { gl.deleteTexture(e.tex); gl.deleteFramebuffer(e.fb); }
-    for (const p of [this.halfProgram, this.denoiseProgram, this.compositeProgram, this.downProgram, this.upProgram,
-      this.exposureProgram, this.tonemapProgram, this.fxaaProgram, this.sharpenProgram, this.copyProgram]) gl.deleteProgram(p.program);
   }
 }

@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" width="64" height="64"></canvas>
+<script type="module">
+// Checks the GL-reported std140 offsets of the Frame block against FRAME_OFFSETS.
+import { GLSL_COMMON, FRAME_OFFSETS, FRAME_FLOATS, FULLSCREEN_VS } from '../../../../src/render/common.js';
+const gl = document.getElementById('c').getContext('webgl2');
+const fs = GLSL_COMMON + `
+out vec4 o;
+void main() {
+  o = uView[0] + uProj[0] + uViewProj[0] + uInvViewProj[0] + uShadowMat[0] + uCamPos + uSunDir + uMoonDir + uLightDir
+    + uRes + uCam + uShadow + uEnv + uWind + uQuality + uPrevViewProj[0] + uTAA + uCamDelta;
+}`;
+const mk = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh)); return sh; };
+const p = gl.createProgram();
+gl.attachShader(p, mk(gl.VERTEX_SHADER, FULLSCREEN_VS));
+gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(p);
+if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+const bi = gl.getUniformBlockIndex(p, 'Frame');
+const size = gl.getActiveUniformBlockParameter(p, bi, gl.UNIFORM_BLOCK_DATA_SIZE);
+const names = Object.keys(FRAME_OFFSETS);
+const idx = gl.getUniformIndices(p, names);
+const offs = gl.getActiveUniforms(p, idx, gl.UNIFORM_OFFSET);
+const res = [];
+let ok = size === FRAME_FLOATS * 4;
+res.push(`block size ${size} bytes vs FRAME_FLOATS*4 = ${FRAME_FLOATS * 4}`);
+names.forEach((n, i) => { const good = offs[i] === FRAME_OFFSETS[n] * 4; ok = ok && good; res.push(`${good ? 'ok  ' : 'FAIL'} ${n}: gl ${offs[i]} js ${FRAME_OFFSETS[n] * 4}`); });
+console.log(res.join('\n'));
+console.log(ok ? 'UBO LAYOUT OK' : 'UBO LAYOUT MISMATCH');
+window.__done = true;
+</script>

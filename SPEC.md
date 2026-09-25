@@ -50,7 +50,8 @@ src/
   render/overlays.js    Terrain-render agent (selection box, particles draw, held block)
   particles.js          Terrain-render agent (CPU particle simulation)
   render/atmosphere.js  Sky/post agent (sky LUT, irradiance, sky pass, noise textures)
-  render/post.js        Sky/post agent (volumetrics, clouds composite, bloom, exposure, tonemap, FXAA)
+  render/post.js        Sky/post agent (volumetrics, clouds composite, bloom, exposure, tonemap, TAA sharpen / FXAA)
+  render/taa.js         Sky/post agent (temporal anti-aliasing + temporal upscaling: jitter, history, resolve)
   renderer.js           Sky/post agent (frame graph orchestration)
   player.js             Player agent
   input.js              Player agent
@@ -216,7 +217,19 @@ when `window.__WORKER_SRC__` is defined by the single-file build).
   When shadows are off the renderer still binds a 1×1 depth texture (cleared to 1) on units 3/4.
 - Shared GLSL helpers: `ign/ignFrame, linearDepth, positionFromDepth, shadowDistort, shadowCoord,
   shadowTexelWorld, skyLutUV/skyLutDir/sampleSky, skyIrradiance, groundIrradiance, lightColor,
-  sunDiskRadiance, ambientLight(n), henyeyGreenstein, cloudCoverage, cloudShadow, applyFog`.
+  sunDiskRadiance, ambientLight(n), henyeyGreenstein, cloudCoverage, cloudShadow, applyFog`,
+  `taaOn()`, `ignTemporal(p)` (= `ignFrame` with TAA, `ign` without: dither patterns may change every
+  frame only when the resolve averages them; used by PCF/PCSS kernel rotation, SSR and cloud march jitter).
+- Frame block fields for temporal anti-aliasing (see "Temporal anti-aliasing" below). With TAA on,
+  `uProj`, `uViewProj` and `uInvViewProj` carry this frame's sub-pixel jitter, so every pass that
+  rasterises geometry or rebuilds view rays from `positionFromDepth` / `uInvViewProj` (terrain, water +
+  SSR, particles, selection, sky, half-res light shafts + clouds, composite) is jittered consistently;
+  `uShadowMat` never is. `uProj[1][1]` (focal length) is unaffected by the jitter.
+  - `uPrevViewProj` (mat4): the previous frame's UNJITTERED view-projection, camera-relative to the
+    previous camera (reprojection).
+  - `uTAA` (vec4): xy = jitter in render pixels (the image moves by +xy), z = TAA on 0/1, w = history
+    valid 0/1 (0 on the first frame, after a resize or a camera cut).
+  - `uCamDelta` (vec4): xyz = camPos − prevCamPos in blocks (computed in JS doubles), w = 0.
 - `GLSL_BLOCK_VERTEX`: attribute declarations + decoders for packed chunk vertices, `FACE_N/T/B` tables.
 - `FrameUniforms` (JS writer for the UBO), `computeShadowMatrix(camPos, lightDir, radius)`.
 
@@ -276,7 +289,12 @@ export class Overlays {
 }
 ```
 `drawHeld` renders the selected block in the lower right like Minecraft's first-person item (cube for cube
-blocks, flat sprite for plants/torch), with its own projection, into the HDR target after compositing.
+blocks, flat sprite for plants/torch), with its own projection (never jittered), into the HDR target the post
+chain reads, after compositing and after the TAA resolve (so it is neither jittered nor in the history), with
+its own cleared depth. `view.aspect` / `view.targetSize` describe that target. Because TAA can't smooth it,
+its outline is anti-aliased analytically: cube faces are pushed out 1.5 px across silhouette edges and fade
+over ±0.5 px around the true edge; sprite planes get a one-pixel alpha coverage ramp; alpha-blended
+(colour `SRC_ALPHA, ONE_MINUS_SRC_ALPHA`, alpha `ONE, ONE_MINUS_SRC_ALPHA`).
 
 ### Sky + post (`src/render/atmosphere.js`, `src/render/post.js`) and the frame graph (`src/renderer.js`)
 ```js
@@ -297,32 +315,79 @@ Time of day: 0 = sunrise, 0.25 = noon, 0.5 = sunset, 0.75 = midnight. Sun direct
 `a = timeOfDay·2π`, `sunDir = normalize(cos a, sin a·cos φ, sin a·sin φ)` with φ = 25° tilt toward +Z;
 `moonDir = −sunDir`. Shadows follow the sun while it is above −3°, otherwise the moon.
 
-Frame graph (render size = canvas size × renderScale):
+Frame graph (render size = canvas size × renderScale; output size = canvas size):
 1. `atmosphere.update(frame)`: sky-view LUT `SKY_LUT_W × SKY_LUT_H` RGBA16F (single-scattering Rayleigh + Mie +
    ozone, 16 view steps × 8 light steps, sun plus a faint moon-lit sky, parametrised by `skyLutDir`),
    irradiance texture (8 + 2×64 texels: 4 lighting texels incl. directional ambient, plus a 128-texel far-terrain
    horizon summary; texel meanings in common.js: integrate the LUT over the hemisphere for sky
    irradiance; ground bounce ≈ albedo 0.25 × (sun + sky); light colour = transmittance to the sun × intensity,
    or moonlight (0.25, 0.32, 0.45)×0.12 at night; sun disk radiance). Night sky must stay deep blue, not black.
-2. Shadow pass (if enabled) into a `shadowRes²` DEPTH_COMPONENT24 texture: `terrain.drawShadow`.
-3. Scene FBO (RGBA16F colour + DEPTH_COMPONENT24 texture): `terrain.drawOpaque`, `overlays.drawParticles`,
+2. Shadow pass (if enabled) into a `shadowRes²` DEPTH_COMPONENT24 texture: `terrain.drawShadow` (never
+   jittered).
+3. Scene FBO (RGBA16F colour + DEPTH_COMPONENT24 texture, render size, jittered with TAA):
+   `terrain.drawOpaque`, `overlays.drawParticles`,
    then `atmosphere.drawSky` (full-screen on the far plane, depth LEQUAL, no depth write): LUT colour,
    sun disk with limb darkening, moon disk with phases shading, twinkling stars rotating with `uWind.z`.
 4. Blit scene colour + depth into copies (units 10, 11) → `terrain.drawWater` into the scene FBO → `overlays.drawSelection`.
 5. `post.volumetrics`: half-res ray march from the camera to the scene depth (`uQuality.y` steps, IGN
    dither), sampling the shadow map (single tap) × cloud shadow × height-fog density × HG phase (g ≈ 0.6
-   blended with isotropic); stronger, blue-green scattering when underwater.
-6. `post.composite` → HDR target: scene + depth-aware upsampled volumetrics; volumetric clouds between
+   blended with isotropic); stronger, blue-green scattering when underwater. Then a 3×3 depth-aware
+   denoise of the half-res buffers: a box without TAA; with TAA (per-frame dither, averaged by the
+   resolve) a lighter kernel (neighbours × 0.35, corners × 0.35²) that keeps shafts and cloud edges sharper.
+6. `post.composite` → composite target (render size, RGBA16F; alpha = 1 − self-emission from the terrain
+   pass): scene + depth-aware upsampled volumetrics; volumetric clouds between
    `CLOUD_BOTTOM`/`CLOUD_TOP` (density = `cloudCoverage(xz)` × height profile − `uNoise3D` erosion,
    `uQuality.z` steps + 2 light steps, Beer–powder, dual-lobe HG, ambient from `skyIrradiance`, fading
    into `sampleSky` haze with distance, occluded by scene depth); underwater fog/absorption when
-   `uEnv.x == 1`. Then `overlays.drawHeld` into the same target (own depth renderbuffer, cleared).
-7. Bloom: 6-level 13-tap downsample / tent upsample chain.
-8. Auto exposure: average log luminance of the smallest bloom level → 1×1 target blended over time
-   (ping-pong), clamped so night is still readable and caves still get dark.
+   `uEnv.x == 1`.
+   6b. With TAA: `post.resolve` (render/taa.js) → output-size HDR target (+ next history); see below.
+   Then `overlays.drawHeld` into the HDR target the rest of the chain reads (TAA output, or the
+   composite without TAA), with its own depth renderbuffer, cleared.
+7. Bloom: 6-level 13-tap downsample / tent upsample chain from that HDR target (output size with TAA,
+   render size without). Alpha (1 − self-emission) is carried down the chain (plain 4-tap average).
+8. Auto exposure: meters bloom level 4 (plain downsample, before the upsample adds into it) and the
+   scene depth (sky detection, uv-based so any size works) → 1×1 target blended over time (ping-pong),
+   clamped so night is still readable and caves still get dark.
 9. Tone map: exposure, bloom mix (~4–6%), ACES filmic, slight saturation/contrast grade, vignette,
-   sRGB encode, ±0.5/255 dither, luma → alpha.
-10. FXAA to the canvas (or straight copy when FXAA is off), upscaling from render size to canvas size.
+   sRGB encode, luma → alpha, ±0.5/255 dither (into an RGBA8 target; with TAA and float targets the
+   tone-mapped image stays RGBA16F and the final pass dithers after sharpening).
+10. Final pass to the canvas by `settings.aa`: `taa` → RCAS (AMD FSR1 robust contrast-adaptive sharpening,
+    strength 0.5 at native, up to 0.8 at renderScale 0.5, lobe limited to the 4-neighbour min/max, reduced
+    on noise) in sRGB space + dither, same size; `fxaa` → FXAA 3.11 upscaling from render size;
+    `off` → straight copy (or the tone map writes the canvas directly when no scaling is needed).
+
+### Temporal anti-aliasing (`src/render/taa.js`, owned by `PostProcess` as `post.taa`)
+Setting `settings.aa`: `'taa' | 'fxaa' | 'off'` (config.js; presets Low → fxaa, Medium/High/Ultra → taa
+with renderScale 0.75 / 0.85 / 0.85). `Renderer.applySettings` reads `aa`; a settings object without a
+valid `aa` falls back to its boolean `fxaa` (true → fxaa, false → off). `loadSettings` migrates old saves.
+- Jitter: Halton(2, 3) − 0.5 in render pixels, 8 phases at native resolution, 16 when upscaling; applied as
+  an NDC offset `2·jitter / renderSize` to the projection (`clip.xy += offset · clip.w`).
+- `TemporalAA.begin({ camPos, fwd, sunDir, viewProj (unjittered), scale })` once per frame: jitter,
+  previous unjittered view-projection, camera delta, and `valid`. Camera cuts start a fresh history:
+  moving > 4 blocks or turning > 60° in one frame (teleport), or the sun jumping > 2° (setTime).
+- Targets (output size): history colour ×2 (HDR format, linear filter), aux ×2 (same format: rg = dilated
+  linear depth as 16-bit fixed point of sqrt(depth / 2048), b = accumulated weight / 32), output colour
+  (HDR, alpha = 1 − self-emission) + depth renderbuffer for the held item. One MRT pass writes history,
+  aux and output. Recreated (history reset) when the canvas size changes; a renderScale change keeps them.
+- Resolve, per output pixel (uv at the pixel centre, unjittered):
+  1. Current frame: the 3×3 render texels around `uv · renderSize + jitter`. Each texel is a sample at
+     distance d from the pixel centre; weights `exp(−2.29 d²)` (Blackman-Harris fit) × `1/(1 + luma·exposure)`.
+     Two reconstructions: narrow (d in output pixels: sharp, what accumulates) and wide (d in render
+     pixels: smooth upscale, used where there is little history). Confidence = the largest narrow kernel
+     weight (how close the nearest jittered sample is).
+  2. Reprojection (static world): the front-most depth of the 3×3 (dilation); its camera-relative
+     position from `uInvViewProj` at that texel, + `uCamDelta`, projected with `uPrevViewProj`; sky
+     (depth 1) by direction only (w = 0). Motion = previous uv − the texel's unjittered uv.
+  3. Rejection: off-screen, or the aux depth over the 2×2 footprint at the history uv differs from the
+     surface's previous depth (`uPrevViewProj` clip w) by more than 4% + 0.05 + the 3×3 depth spread;
+     sky ↔ geometry mismatches always reject. `uTAA.w == 0` rejects everything.
+  4. History: 5-tap Catmull-Rom at the history uv. Variance clipping in YCoCg of the exposed, reversibly
+     compressed colour `c / (1 + max(c))` against mean ± 1.25 σ of the 3×3; history weight reduced when it
+     was far outside (÷ distance/2) and capped while moving (to 30% of the maximum at ≥ 5 px/frame).
+  5. Blend: weights `confidence / (1 + luma)` and `W / (1 + luma)` (W = accumulated history weight, capped at
+     8 native → 12 at renderScale 0.5, 4 for RGBA8 history): ~0.1 per frame at native resolution, a fresh
+     history converges as 1/n. No history → the wide reconstruction alone (the first frame after a reset
+     shows only the current frame). RGBA8 history (no float targets) is dithered ±0.5 LSB.
 
 Noise textures (created by `atmosphere.js`): `uNoise2D` 256² RGBA8 REPEAT/LINEAR/mipmapped — r, g, b =
 tileable fbm (value/perlin) with base periods of 4, 8, 16 cells over the texture, contrast-stretched to use

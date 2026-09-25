@@ -1,0 +1,86 @@
+<!doctype html><meta charset="utf-8"><canvas id="c" style="width:320px;height:180px"></canvas>
+<script type="module">
+// TAA checks without a world: builds the renderer, renders a few frames (sky + held block) in
+// every anti-aliasing mode, switches modes / render scale / canvas size, and reports GL errors and
+// the history bookkeeping. ?rgba8 simulates a GPU without float render targets.
+//   node tools/run-page.mjs tools/tests/taa/compile.html --until window.__done --wait 200000
+//   node tools/run-page.mjs "tools/tests/taa/compile.html?rgba8" --until window.__done --wait 200000
+if (location.search.includes('rgba8')) {
+  const orig = WebGL2RenderingContext.prototype.getExtension;
+  WebGL2RenderingContext.prototype.getExtension = function (name) {
+    return /color_buffer_(half_)?float/i.test(name) ? null : orig.call(this, name);
+  };
+}
+const { buildTextures } = await import('../../../src/textures.js');
+const { Renderer } = await import('../../../src/renderer.js');
+const out = [];
+let failed = false;
+const check = (ok, text) => { out.push(`${ok ? 'ok  ' : 'FAIL'} ${text}`); if (!ok) failed = true; };
+try {
+  const canvas = document.getElementById('c');
+  const tex = buildTextures();
+  const r = new Renderer(canvas, tex, { aa: 'taa', renderScale: 1, renderDistance: 4, shadowRes: 1024, shadowRadius: 64, volumetrics: 12, clouds: 10, ssr: 16 });
+  const gl = r.gl;
+  const taa = r.post.taa;
+  let yaw = 0.3;
+  const frame = (extra = {}) => {
+    yaw += 0.01;
+    r.render({ camPos: [0.5, 80, 0.5], yaw, pitch: 0.1, fov: 1.3, time: yaw, dt: 1 / 60, timeOfDay: 0.3, eyeSkyLight: 1, cloudCoverage: 0.5,
+      held: { blockId: 1, swing: 0, equip: 0, bobX: 0, bobY: 0, light: [1, 0] }, ...extra });
+  };
+  const glOk = () => gl.getError() === 0;
+  out.push(`hdr ${r.caps.hdr}`);
+  frame(); frame(); frame();
+  check(glOk() && r.stats.aa === 'taa' && taa.historyOk && taa.valid, `taa native ${r.stats.renderWidth}x${r.stats.renderHeight}->${r.stats.width}x${r.stats.height}, passes ${r.stats.passes}`);
+  const jit = [];
+  for (let i = 0; i < 8; i++) { frame(); jit.push(r.jitter.join(',')); }
+  check(new Set(jit).size === 8, `8 distinct jitter offsets at native (${jit.slice(0, 3).join(' | ')} ...)`);
+  r.applySettings({ ...r.settings, renderScale: 0.5 });
+  check(taa.historyOk, 'renderScale change keeps the history');
+  frame(); frame();
+  check(glOk() && taa.valid && r.stats.renderWidth * 2 === r.stats.width, `taa scale 0.5 ${r.stats.renderWidth}x${r.stats.renderHeight}->${r.stats.width}x${r.stats.height}`);
+  const jit16 = new Set();
+  for (let i = 0; i < 16; i++) { frame(); jit16.add(r.jitter.join(',')); }
+  check(jit16.size === 16, '16 jitter offsets when upscaling');
+  const cuts = taa.cuts;
+  frame({ camPos: [100, 80, 0.5] });
+  check(glOk() && taa.cuts === cuts + 1 && !taa.valid, 'teleport (> 4 blocks) is a camera cut');
+  frame({ camPos: [100, 80, 0.5] });
+  check(taa.valid, 'history valid again on the next frame');
+  yaw += 1.2;
+  frame({ camPos: [100, 80, 0.5] });
+  check(!taa.valid, 'turn > 60 degrees is a camera cut');
+  frame({ camPos: [100, 80, 0.5], timeOfDay: 0.6 });
+  check(!taa.valid, 'sun jump (setTime) restarts the history');
+  canvas.style.width = '400px';
+  r.resize();
+  check(!taa.historyOk, 'canvas size change resets the history');
+  frame();
+  check(glOk() && !taa.valid && r.stats.width === 400, `first frame after resize has no history (${r.stats.width}x${r.stats.height})`);
+  frame();
+  check(taa.valid, 'history valid on the following frame');
+  r.applySettings({ ...r.settings, aa: 'fxaa' });
+  frame(); frame();
+  check(glOk() && r.stats.aa === 'fxaa' && !taa.targets, 'fxaa: TAA targets released');
+  r.applySettings({ ...r.settings, aa: 'off', renderScale: 1 });
+  frame(); frame();
+  check(glOk() && r.stats.aa === 'off', 'off at native (direct tone map to the canvas)');
+  r.applySettings({ ...r.settings, aa: 'off', renderScale: 0.75 });
+  frame();
+  check(glOk() && r.stats.aa === 'off', 'off upscaled (copy pass)');
+  r.applySettings({ ...r.settings, aa: undefined, fxaa: true });
+  frame();
+  check(glOk() && r.settings.aa === 'fxaa', 'legacy settings { fxaa: true } -> fxaa');
+  r.applySettings({ renderDistance: 4, fxaa: false });
+  frame();
+  check(glOk() && r.settings.aa === 'off', 'legacy settings { fxaa: false } -> off');
+  r.applySettings({ renderDistance: 4, aa: 'taa', fxaa: false });
+  frame(); frame();
+  check(glOk() && r.stats.aa === 'taa' && taa.valid, 'aa wins over a stale fxaa field; TAA back on');
+  r.dispose();
+  check(glOk(), 'dispose');
+} catch (e) { out.push('EXCEPTION ' + (e.stack || e.message)); failed = true; }
+console.log(out.join('\n'));
+if (failed) console.error('TAA checks failed');
+window.__done = true;
+</script>

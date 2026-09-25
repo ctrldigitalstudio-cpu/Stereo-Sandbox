@@ -3,26 +3,22 @@
 const STORAGE_KEY = 'stereo-sandbox.settings.v1';
 const LEGACY_STORAGE_KEY = 'blockvale.settings.v1'; // before the rename to Stereo Sandbox: read-only fallback
 
-// Anti-aliasing: TAA (temporal, with upscaling) from Medium up. It reconstructs a sharp canvas-
-// resolution image from a lower render resolution (0.85 looks the same as native in stills and
-// nearly so in motion, 0.75 slightly softer in motion), so those presets render below native
-// resolution and spend the time on the effects instead. Low keeps FXAA (no history targets).
 export const QUALITY_PRESETS = {
   low: {
     renderDistance: 6, renderScale: 0.75, shadows: false, shadowRes: 1024, shadowRadius: 64, pcss: false,
-    volumetrics: 0, clouds: 0, ssr: 0, bloom: true, aa: 'fxaa',
+    volumetrics: 0, clouds: 0, ssr: 0, bloom: true, fxaa: true,
   },
   medium: {
-    renderDistance: 8, renderScale: 0.75, shadows: true, shadowRes: 1024, shadowRadius: 96, pcss: false,
-    volumetrics: 12, clouds: 10, ssr: 16, bloom: true, aa: 'taa',
+    renderDistance: 8, renderScale: 1, shadows: true, shadowRes: 1024, shadowRadius: 96, pcss: false,
+    volumetrics: 12, clouds: 10, ssr: 16, bloom: true, fxaa: true,
   },
   high: {
-    renderDistance: 10, renderScale: 0.85, shadows: true, shadowRes: 2048, shadowRadius: 128, pcss: true,
-    volumetrics: 16, clouds: 16, ssr: 24, bloom: true, aa: 'taa',
+    renderDistance: 10, renderScale: 1, shadows: true, shadowRes: 2048, shadowRadius: 128, pcss: true,
+    volumetrics: 16, clouds: 16, ssr: 24, bloom: true, fxaa: true,
   },
   ultra: {
-    renderDistance: 12, renderScale: 0.85, shadows: true, shadowRes: 4096, shadowRadius: 160, pcss: true,
-    volumetrics: 24, clouds: 24, ssr: 32, bloom: true, aa: 'taa',
+    renderDistance: 12, renderScale: 1, shadows: true, shadowRes: 4096, shadowRadius: 160, pcss: true,
+    volumetrics: 24, clouds: 24, ssr: 32, bloom: true, fxaa: true,
   },
 };
 
@@ -55,7 +51,7 @@ export const SETTINGS_SCHEMA = [
     { key: 'clouds', label: 'Volumetric clouds', type: 'select', options: [[0, 'Off'], [10, 'Low'], [16, 'Medium'], [24, 'High']] },
     { key: 'ssr', label: 'Water reflections', type: 'select', options: [[0, 'Sky only'], [16, 'Low'], [24, 'Medium'], [32, 'High']] },
     { key: 'bloom', label: 'Bloom', type: 'toggle' },
-    { key: 'aa', label: 'Anti-aliasing', type: 'select', options: [['taa', 'TAA'], ['fxaa', 'FXAA'], ['off', 'Off']] },
+    { key: 'fxaa', label: 'Anti-aliasing (FXAA)', type: 'toggle' },
   ] },
   { group: 'World', items: [
     { key: 'dayLength', label: 'Day length', type: 'select', options: [[300, '5 min'], [600, '10 min'], [1200, '20 min'], [2400, '40 min'], [0, 'Frozen']] },
@@ -76,7 +72,6 @@ export const SETTINGS_SCHEMA = [
 
 // Keys that belong to a quality preset; changing one of them switches the preset to 'custom'.
 export const PRESET_KEYS = Object.keys(QUALITY_PRESETS.high);
-export const AA_MODES = ['taa', 'fxaa', 'off'];
 
 export function loadSettings() {
   let saved = {};
@@ -86,16 +81,6 @@ export function loadSettings() {
   } catch (e) { /* storage unavailable or corrupt */ }
   const s = { ...DEFAULT_SETTINGS };
   for (const k in saved) if (k in DEFAULT_SETTINGS) s[k] = saved[k];
-  // Settings saved before anti-aliasing became a choice had a boolean `fxaa` instead of `aa`.
-  // An untouched named preset (FXAA was on in all of them) takes that preset's current values
-  // (TAA and its render scale: the player chose "High", not its old numbers); anything else keeps
-  // its choice: fxaa true -> FXAA, false -> off.
-  if (!('aa' in saved) && typeof saved.fxaa === 'boolean') {
-    const preset = QUALITY_PRESETS[s.preset];
-    if (preset && saved.fxaa) Object.assign(s, preset);
-    else s.aa = saved.fxaa ? 'fxaa' : 'off';
-  }
-  if (!AA_MODES.includes(s.aa)) s.aa = DEFAULT_SETTINGS.aa;
   return s;
 }
 

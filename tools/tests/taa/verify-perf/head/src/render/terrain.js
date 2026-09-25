@@ -119,9 +119,9 @@ float shadowVisibility(vec3 posRel, vec3 offsetDir, float fallback, bool soft, o
   sc.z -= 0.00005;
   float texel = 1.0 / uShadow.z;
   float uvPerBlock = (1.0 - SHADOW_DISTORT) / (2.0 * uShadow.y * f * f);
-  // Per-pixel rotation of the kernel: static without TAA (a per-frame pattern would only make
-  // penumbrae crawl), per frame with it (the resolve averages the rotations into smooth penumbrae).
-  float a = ignTemporal(gl_FragCoord.xy) * 6.2831853;
+  // Static per-pixel rotation: there is no temporal accumulation, so a per-frame pattern would
+  // only make penumbrae crawl.
+  float a = ign(gl_FragCoord.xy) * 6.2831853;
   mat2 rot = mat2(cos(a), sin(a), -sin(a), cos(a));
   float vis = 0.0;
   float thickness;
@@ -613,7 +613,7 @@ void main() {
     vec3 refl = skyReflection(R, vWorld) * skyVis;
     if (uQuality.x > 0.5) {
       float hit;
-      vec3 ssr = traceSSR(posRel + Ng * 0.02, R, ignTemporal(gl_FragCoord.xy), hit);
+      vec3 ssr = traceSSR(posRel + Ng * 0.02, R, ign(gl_FragCoord.xy), hit);
       refl = mix(refl, ssr, hit);
     }
     float NdotV = max(dot(N, V), 0.0);
